@@ -29,8 +29,10 @@ import sys
 import json
 import time
 import threading
+import dataclasses
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, List
 from dotenv import load_dotenv
 
 # ── Rich TUI ──────────────────────────────────────────────────
@@ -426,6 +428,245 @@ def show_history(api: tradeapi.REST, limit: int = 20):
 
 
 # ══════════════════════════════════════════════════════════════
+#  MÓDULO: ALERTAS DE PREÇO
+# ══════════════════════════════════════════════════════════════
+
+@dataclass
+class PriceAlert:
+    """Representa um alerta de preço."""
+    id:        int
+    symbol:    str
+    condition: str        # "above" | "below"
+    target:    float
+    note:      str = ""
+    triggered: bool = False
+    created_at: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M"))
+    triggered_at: str = ""
+
+
+class AlertManager:
+    """
+    Gere alertas de preço em background.
+    Corre uma thread dedicada que verifica os preços a cada `interval` segundos.
+    """
+
+    def __init__(self, api: tradeapi.REST, interval: int = 30):
+        self.api       = api
+        self.interval  = interval
+        self.alerts: List[PriceAlert] = []
+        self._lock     = threading.Lock()
+        self._stop_evt = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._next_id  = 1
+
+    # ── CRUD ──────────────────────────────────────────────────
+
+    def add_alert(self, symbol: str, condition: str, target: float, note: str = "") -> PriceAlert:
+        with self._lock:
+            alert = PriceAlert(
+                id=self._next_id,
+                symbol=symbol.upper(),
+                condition=condition,
+                target=target,
+                note=note,
+            )
+            self.alerts.append(alert)
+            self._next_id += 1
+        return alert
+
+    def remove_alert(self, alert_id: int) -> bool:
+        with self._lock:
+            before = len(self.alerts)
+            self.alerts = [a for a in self.alerts if a.id != alert_id]
+            return len(self.alerts) < before
+
+    def clear_triggered(self):
+        with self._lock:
+            self.alerts = [a for a in self.alerts if not a.triggered]
+
+    def list_alerts(self) -> List[PriceAlert]:
+        with self._lock:
+            return list(self.alerts)
+
+    # ── VERIFICAÇÃO ───────────────────────────────────────────
+
+    def _get_price(self, symbol: str) -> Optional[float]:
+        try:
+            bars = self.api.get_bars(symbol, tradeapi.TimeFrame.Minute, limit=1).df
+            if not bars.empty:
+                return float(bars.iloc[-1]["close"])
+        except Exception:
+            pass
+        return None
+
+    def _check_alerts(self):
+        """Verifica todos os alertas activos e dispara os que foram atingidos."""
+        with self._lock:
+            active = [a for a in self.alerts if not a.triggered]
+
+        # agrupa por símbolo para minimizar chamadas à API
+        symbols = list({a.symbol for a in active})
+        prices = {s: self._get_price(s) for s in symbols}
+
+        for alert in active:
+            price = prices.get(alert.symbol)
+            if price is None:
+                continue
+
+            fired = (
+                (alert.condition == "above" and price >= alert.target) or
+                (alert.condition == "below" and price <= alert.target)
+            )
+
+            if fired:
+                with self._lock:
+                    alert.triggered = True
+                    alert.triggered_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                # notificação no terminal (visível mesmo durante o menu)
+                icon = "🔴" if alert.condition == "below" else "🟢"
+                console.print(
+                    f"\n  {icon} [bold yellow]ALERTA DISPARADO![/bold yellow]  "
+                    f"[bold]{alert.symbol}[/bold] "
+                    f"{'≥' if alert.condition == 'above' else '≤'} "
+                    f"${alert.target:,.2f}  "
+                    f"→  Preço actual: [bold cyan]${price:,.2f}[/bold cyan]"
+                    + (f"  [dim]({alert.note})[/dim]" if alert.note else "")
+                )
+
+    # ── THREAD ────────────────────────────────────────────────
+
+    def _run(self):
+        while not self._stop_evt.is_set():
+            self._check_alerts()
+            self._stop_evt.wait(self.interval)
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_evt.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="AlertMonitor")
+        self._thread.start()
+
+    def stop(self):
+        self._stop_evt.set()
+
+
+# ── UI de Alertas ──────────────────────────────────────────────
+
+def show_alerts(manager: AlertManager):
+    """Lista todos os alertas configurados."""
+    alerts = manager.list_alerts()
+
+    if not alerts:
+        console.print("[yellow]Sem alertas configurados.[/yellow]")
+        return
+
+    table = Table(box=box.ROUNDED, border_style="yellow", header_style="bold yellow")
+    table.add_column("ID",        width=4,  justify="center")
+    table.add_column("Ticker",    width=8)
+    table.add_column("Condição",  width=10)
+    table.add_column("Alvo",      width=12, justify="right")
+    table.add_column("Estado",    width=12)
+    table.add_column("Nota",      width=20)
+    table.add_column("Criado em", width=14)
+
+    for a in alerts:
+        cond_str = (
+            f"[green]≥ Acima[/green]" if a.condition == "above"
+            else f"[red]≤ Abaixo[/red]"
+        )
+        if a.triggered:
+            estado = f"[dim]✅ Disparado\n{a.triggered_at}[/dim]"
+        else:
+            estado = "[cyan]⏳ Activo[/cyan]"
+
+        table.add_row(
+            str(a.id),
+            a.symbol,
+            cond_str,
+            f"${a.target:,.2f}",
+            estado,
+            a.note or "—",
+            a.created_at,
+        )
+
+    total   = len(alerts)
+    activos = sum(1 for a in alerts if not a.triggered)
+    console.print(Panel(
+        table,
+        title=f"[bold yellow]🔔 Alertas de Preço  [dim]({activos} activos / {total} total)[/dim][/bold yellow]",
+        border_style="yellow",
+    ))
+
+
+def add_alert_ui(manager: AlertManager):
+    """Fluxo interactivo para criar um alerta."""
+    console.print(Rule("[bold yellow]➕ Novo Alerta de Preço[/bold yellow]"))
+
+    symbol    = Prompt.ask("  Ticker (ex: AAPL, TSLA)").upper().strip()
+    condition = Prompt.ask("  Condição", choices=["above", "below"], default="above")
+    target    = float(Prompt.ask("  Preço alvo ($)"))
+    note      = Prompt.ask("  Nota (opcional)", default="").strip()
+
+    arrow = "≥" if condition == "above" else "≤"
+    console.print(
+        f"\n  Alerta: [bold]{symbol}[/bold] quando preço {arrow} [bold cyan]${target:,.2f}[/bold cyan]"
+        + (f"  [dim]— {note}[/dim]" if note else "")
+    )
+
+    if Confirm.ask("  Confirmas?"):
+        alert = manager.add_alert(symbol, condition, target, note)
+        console.print(f"[green]✅ Alerta #{alert.id} criado! A monitorizar a cada {manager.interval}s.[/green]")
+    else:
+        console.print("[dim]Cancelado.[/dim]")
+
+
+def remove_alert_ui(manager: AlertManager):
+    """Remove um alerta pelo ID."""
+    show_alerts(manager)
+    if not manager.list_alerts():
+        return
+    alert_id = Prompt.ask("  ID do alerta a remover").strip()
+    try:
+        if manager.remove_alert(int(alert_id)):
+            console.print(f"[green]✅ Alerta #{alert_id} removido.[/green]")
+        else:
+            console.print(f"[yellow]Alerta #{alert_id} não encontrado.[/yellow]")
+    except ValueError:
+        console.print("[red]ID inválido.[/red]")
+
+
+def alerts_menu(manager: AlertManager):
+    """Submenu de gestão de alertas."""
+    while True:
+        console.print(Rule("[bold yellow]🔔 Alertas de Preço[/bold yellow]"))
+        console.print(
+            "  [bold cyan]1[/bold cyan] Ver alertas\n"
+            "  [bold cyan]2[/bold cyan] Criar alerta\n"
+            "  [bold cyan]3[/bold cyan] Remover alerta\n"
+            "  [bold cyan]4[/bold cyan] Limpar disparados\n"
+            "  [bold cyan]0[/bold cyan] Voltar\n"
+        )
+        op = Prompt.ask("  Opção", default="0").strip()
+
+        if op == "0":
+            break
+        elif op == "1":
+            show_alerts(manager)
+        elif op == "2":
+            add_alert_ui(manager)
+        elif op == "3":
+            remove_alert_ui(manager)
+        elif op == "4":
+            manager.clear_triggered()
+            console.print("[green]✅ Alertas disparados removidos.[/green]")
+
+        console.print()
+        input("  ↩  Prima Enter para continuar…")
+
+
+# ══════════════════════════════════════════════════════════════
 #  MENU PRINCIPAL
 # ══════════════════════════════════════════════════════════════
 
@@ -437,7 +678,8 @@ MENU_OPTIONS = {
     "5": ("❌ Cancelar Ordem",       "cancel"),
     "6": ("📉 Cotação Rápida",       "quote"),
     "7": ("📜 Histórico de Trades",  "history"),
-    "8": ("🤖 Assistente IA",        "ai"),
+    "8": ("🔔 Alertas de Preço",     "alerts"),
+    "9": ("🤖 Assistente IA",        "ai"),
     "0": ("🚪 Sair",                 "exit"),
 }
 
@@ -465,6 +707,11 @@ def main():
     console.print(f"[green]✅ Ligação ao Alpaca estabelecida[/green]  [dim]({'Paper' if PAPER_MODE else 'Live'})[/dim]")
     if ai_client:
         console.print("[green]✅ Assistente IA (Claude) activo[/green]")
+
+    # Iniciar gestor de alertas em background (verifica a cada 30s)
+    alert_manager = AlertManager(api, interval=30)
+    alert_manager.start()
+    console.print("[green]✅ Monitor de alertas activo[/green]  [dim](intervalo: 30s)[/dim]")
     console.print()
 
     while True:
@@ -479,6 +726,7 @@ def main():
         console.print()
 
         if action == "exit":
+            alert_manager.stop()
             console.print("[dim]Até logo! 👋[/dim]")
             break
         elif action == "account":
@@ -495,6 +743,8 @@ def main():
             get_quote(api)
         elif action == "history":
             show_history(api)
+        elif action == "alerts":
+            alerts_menu(alert_manager)
         elif action == "ai":
             if ai_client:
                 ai_assistant(ai_client, api)
