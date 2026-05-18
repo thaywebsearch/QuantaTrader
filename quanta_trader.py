@@ -1124,20 +1124,310 @@ def sltp_menu(sltp_manager: SLTPManager, api: tradeapi.REST):
 
 
 # ══════════════════════════════════════════════════════════════
+#  MÓDULO: WATCHLIST (ticker tape ao vivo)
+# ══════════════════════════════════════════════════════════════
+
+# Tickers pré-definidos por categoria (editável pelo utilizador)
+DEFAULT_WATCHLIST = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "GOOGL", "SPY", "QQQ", "BTC/USD"]
+
+@dataclass
+class TickerSnap:
+    """Snapshot de um ticker num dado instante."""
+    symbol:  str
+    open:    float = 0.0
+    high:    float = 0.0
+    low:     float = 0.0
+    close:   float = 0.0
+    prev:    float = 0.0   # fecho anterior (para calcular variação do dia)
+    volume:  int   = 0
+    updated: str   = ""
+    error:   bool  = False
+
+
+class Watchlist:
+    """
+    Mantém uma lista de tickers e actualiza os preços em background.
+    Expõe os dados para o Live display do Rich.
+    """
+
+    def __init__(self, api: tradeapi.REST, symbols: List[str], interval: int = 20):
+        self.api      = api
+        self.interval = interval
+        self._lock    = threading.Lock()
+        self._stop    = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._snaps: dict[str, TickerSnap] = {s.upper(): TickerSnap(symbol=s.upper()) for s in symbols}
+
+    # ── gestão de símbolos ────────────────────────────────────
+
+    def add(self, symbol: str):
+        s = symbol.upper()
+        with self._lock:
+            if s not in self._snaps:
+                self._snaps[s] = TickerSnap(symbol=s)
+
+    def remove(self, symbol: str):
+        with self._lock:
+            self._snaps.pop(symbol.upper(), None)
+
+    def symbols(self) -> List[str]:
+        with self._lock:
+            return list(self._snaps.keys())
+
+    def snaps(self) -> List[TickerSnap]:
+        with self._lock:
+            return list(self._snaps.values())
+
+    # ── fetch de preços ───────────────────────────────────────
+
+    def _fetch_one(self, symbol: str) -> TickerSnap:
+        snap = TickerSnap(symbol=symbol)
+        try:
+            # barra de 1 minuto (preço actual)
+            bars = self.api.get_bars(symbol, tradeapi.TimeFrame.Minute, limit=2).df
+            if bars.empty:
+                snap.error = True
+                return snap
+            last = bars.iloc[-1]
+            snap.open   = float(last["open"])
+            snap.high   = float(last["high"])
+            snap.low    = float(last["low"])
+            snap.close  = float(last["close"])
+            snap.volume = int(last["volume"])
+
+            # barra diária para calcular variação face ao dia anterior
+            daily = self.api.get_bars(symbol, tradeapi.TimeFrame.Day, limit=2).df
+            if len(daily) >= 2:
+                snap.prev = float(daily.iloc[-2]["close"])
+            elif len(daily) == 1:
+                snap.prev = float(daily.iloc[0]["open"])
+
+            snap.updated = datetime.now().strftime("%H:%M:%S")
+        except Exception:
+            snap.error = True
+        return snap
+
+    def _refresh(self):
+        syms = self.symbols()
+        for sym in syms:
+            snap = self._fetch_one(sym)
+            with self._lock:
+                self._snaps[sym] = snap
+
+    # ── thread ────────────────────────────────────────────────
+
+    def _run(self):
+        self._refresh()          # primeira actualização imediata
+        while not self._stop.is_set():
+            self._stop.wait(self.interval)
+            if not self._stop.is_set():
+                self._refresh()
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="WatchlistFeed")
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+
+    def force_refresh(self):
+        """Actualização manual imediata (bloqueante)."""
+        self._refresh()
+
+
+# ── helpers de formatação ─────────────────────────────────────
+
+def _chg_color(chg_pct: float) -> str:
+    if chg_pct > 0:
+        return "green"
+    if chg_pct < 0:
+        return "red"
+    return "dim"
+
+def _arrow(chg_pct: float) -> str:
+    if chg_pct > 1:   return "▲"
+    if chg_pct > 0:   return "↑"
+    if chg_pct < -1:  return "▼"
+    if chg_pct < 0:   return "↓"
+    return "─"
+
+def _build_watchlist_table(wl: Watchlist) -> Table:
+    """Constrói a tabela Rich com os dados actuais."""
+    table = Table(
+        box=box.SIMPLE_HEAD,
+        border_style="cyan",
+        header_style="bold cyan",
+        show_edge=True,
+        padding=(0, 1),
+    )
+    table.add_column("  Ticker",  width=10, style="bold")
+    table.add_column("Preço",     width=12, justify="right")
+    table.add_column("Var $",     width=10, justify="right")
+    table.add_column("Var %",     width=9,  justify="right")
+    table.add_column("Abertura",  width=10, justify="right")
+    table.add_column("Máx",       width=10, justify="right")
+    table.add_column("Mín",       width=10, justify="right")
+    table.add_column("Volume",    width=12, justify="right")
+    table.add_column("Actualiz.", width=10, justify="right")
+
+    for snap in wl.snaps():
+        if snap.error or snap.close == 0:
+            table.add_row(
+                snap.symbol, "[dim]—[/dim]", "[dim]—[/dim]", "[dim]—[/dim]",
+                "[dim]—[/dim]", "[dim]—[/dim]", "[dim]—[/dim]",
+                "[dim]—[/dim]", "[dim]a carregar…[/dim]",
+            )
+            continue
+
+        chg_abs = snap.close - snap.prev if snap.prev else 0.0
+        chg_pct = (chg_abs / snap.prev * 100) if snap.prev else 0.0
+        color   = _chg_color(chg_pct)
+        arrow   = _arrow(chg_pct)
+        sign    = "+" if chg_abs >= 0 else ""
+
+        table.add_row(
+            f"  {snap.symbol}",
+            f"[bold {color}]${snap.close:,.2f}[/bold {color}]",
+            f"[{color}]{sign}{chg_abs:+.2f}[/{color}]",
+            f"[{color}]{arrow} {sign}{chg_pct:.2f}%[/{color}]",
+            f"${snap.open:,.2f}",
+            f"[green]${snap.high:,.2f}[/green]",
+            f"[red]${snap.low:,.2f}[/red]",
+            f"{snap.volume:,}",
+            f"[dim]{snap.updated}[/dim]",
+        )
+
+    return table
+
+
+# ── UI da Watchlist ───────────────────────────────────────────
+
+def watchlist_live(wl: Watchlist):
+    """
+    Mostra a watchlist em modo Live (actualiza em tempo real).
+    Prima 'q' + Enter ou Ctrl-C para sair.
+    """
+    console.print(
+        f"[dim]  A actualizar cada {wl.interval}s · Prima [bold]Ctrl-C[/bold] ou escreve [bold]q[/bold] + Enter para sair[/dim]\n"
+    )
+
+    stop_live = threading.Event()
+
+    def _input_listener():
+        while not stop_live.is_set():
+            try:
+                v = input()
+                if v.strip().lower() == "q":
+                    stop_live.set()
+            except EOFError:
+                stop_live.set()
+
+    listener = threading.Thread(target=_input_listener, daemon=True)
+    listener.start()
+
+    try:
+        with Live(console=console, refresh_per_second=1, screen=False) as live:
+            while not stop_live.is_set():
+                now = datetime.now().strftime("%Y-%m-%d  %H:%M:%S")
+                table = _build_watchlist_table(wl)
+                panel = Panel(
+                    table,
+                    title=f"[bold cyan]📡 Watchlist  [dim]{now}[/dim][/bold cyan]",
+                    border_style="cyan",
+                    subtitle=f"[dim]{len(wl.symbols())} tickers · intervalo {wl.interval}s[/dim]",
+                )
+                live.update(panel)
+                time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_live.set()
+
+
+def watchlist_menu(wl: Watchlist):
+    """Submenu de gestão da Watchlist."""
+    while True:
+        console.print(Rule("[bold cyan]📡 Watchlist[/bold cyan]"))
+        syms = wl.symbols()
+        console.print(
+            f"  [dim]Tickers actuais:[/dim] "
+            + ("  ".join(f"[bold]{s}[/bold]" for s in syms) if syms else "[dim]nenhum[/dim]")
+        )
+        console.print()
+        console.print(
+            "  [bold cyan]1[/bold cyan] Ver watchlist ao vivo\n"
+            "  [bold cyan]2[/bold cyan] Adicionar ticker\n"
+            "  [bold cyan]3[/bold cyan] Remover ticker\n"
+            "  [bold cyan]4[/bold cyan] Actualizar agora\n"
+            "  [bold cyan]0[/bold cyan] Voltar\n"
+        )
+        op = Prompt.ask("  Opção", default="0").strip()
+
+        if op == "0":
+            break
+
+        elif op == "1":
+            console.clear()
+            banner()
+            watchlist_live(wl)
+
+        elif op == "2":
+            raw = Prompt.ask("  Ticker(s) a adicionar [dim](separa por vírgula)[/dim]")
+            added = []
+            for s in raw.split(","):
+                s = s.strip().upper()
+                if s:
+                    wl.add(s)
+                    added.append(s)
+            if added:
+                console.print(f"[green]✅ Adicionado(s): {', '.join(added)}[/green]")
+                console.print("[dim]  A actualizar preços…[/dim]")
+                threading.Thread(target=wl.force_refresh, daemon=True).start()
+
+        elif op == "3":
+            if not syms:
+                console.print("[yellow]Watchlist vazia.[/yellow]")
+            else:
+                raw = Prompt.ask("  Ticker(s) a remover [dim](separa por vírgula)[/dim]")
+                removed = []
+                for s in raw.split(","):
+                    s = s.strip().upper()
+                    if s in wl.symbols():
+                        wl.remove(s)
+                        removed.append(s)
+                if removed:
+                    console.print(f"[green]✅ Removido(s): {', '.join(removed)}[/green]")
+                else:
+                    console.print("[yellow]Nenhum ticker encontrado na lista.[/yellow]")
+
+        elif op == "4":
+            with console.status("[cyan]A actualizar preços…[/cyan]"):
+                wl.force_refresh()
+            console.print("[green]✅ Preços actualizados.[/green]")
+
+        console.print()
+        input("  ↩  Prima Enter para continuar…")
+
+
+# ══════════════════════════════════════════════════════════════
 #  MENU PRINCIPAL
 # ══════════════════════════════════════════════════════════════
 
 MENU_OPTIONS = {
     "1":  ("💰 Resumo da Conta",           "account"),
     "2":  ("📂 Posições Abertas",          "positions"),
-    "3":  ("📋 Ordens Pendentes",          "orders"),
-    "4":  ("➕ Nova Ordem",                "place"),
-    "5":  ("❌ Cancelar Ordem",            "cancel"),
-    "6":  ("📉 Cotação Rápida",            "quote"),
-    "7":  ("📜 Histórico de Trades",       "history"),
-    "8":  ("🔔 Alertas de Preço",          "alerts"),
-    "9":  ("🛡️  Stop-Loss / Take-Profit",  "sltp"),
-    "10": ("🤖 Assistente IA",             "ai"),
+    "3":  ("📡 Watchlist ao Vivo",         "watchlist"),
+    "4":  ("📋 Ordens Pendentes",          "orders"),
+    "5":  ("➕ Nova Ordem",                "place"),
+    "6":  ("❌ Cancelar Ordem",            "cancel"),
+    "7":  ("📉 Cotação Rápida",            "quote"),
+    "8":  ("📜 Histórico de Trades",       "history"),
+    "9":  ("🔔 Alertas de Preço",          "alerts"),
+    "10": ("🛡️  Stop-Loss / Take-Profit",  "sltp"),
+    "11": ("🤖 Assistente IA",             "ai"),
     "0":  ("🚪 Sair",                      "exit"),
 }
 
@@ -1175,6 +1465,11 @@ def main():
     sltp_manager = SLTPManager(api, interval=15)
     sltp_manager.start()
     console.print("[green]✅ Monitor SL/TP activo[/green]  [dim](intervalo: 15s)[/dim]")
+
+    # Iniciar watchlist em background (actualiza a cada 20s)
+    watchlist = Watchlist(api, DEFAULT_WATCHLIST, interval=20)
+    watchlist.start()
+    console.print("[green]✅ Watchlist activa[/green]  [dim](intervalo: 20s · 10 tickers)[/dim]")
     console.print()
 
     while True:
@@ -1191,12 +1486,15 @@ def main():
         if action == "exit":
             alert_manager.stop()
             sltp_manager.stop()
+            watchlist.stop()
             console.print("[dim]Até logo! 👋[/dim]")
             break
         elif action == "account":
             show_account(api)
         elif action == "positions":
             show_positions(api)
+        elif action == "watchlist":
+            watchlist_menu(watchlist)
         elif action == "orders":
             show_open_orders(api)
         elif action == "place":
