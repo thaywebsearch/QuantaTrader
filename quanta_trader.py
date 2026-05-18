@@ -667,20 +667,478 @@ def alerts_menu(manager: AlertManager):
 
 
 # ══════════════════════════════════════════════════════════════
+#  MÓDULO: STOP-LOSS / TAKE-PROFIT (OCO)
+# ══════════════════════════════════════════════════════════════
+
+@dataclass
+class SLTPGuard:
+    """
+    Representa um conjunto SL/TP associado a uma posição.
+    Pode usar ordens nativas da Alpaca (bracket/OCO) ou ser
+    monitorizado em software pela thread de background.
+    """
+    id:            int
+    symbol:        str
+    qty:           str              # quantidade a fechar
+    side:          str              # "sell" para long, "buy" para short
+    entry_price:   float
+    stop_loss:     Optional[float]  # preço absoluto de SL
+    take_profit:   Optional[float]  # preço absoluto de TP
+    sl_pct:        Optional[float]  # % usada para calcular SL (apenas display)
+    tp_pct:        Optional[float]  # % usada para calcular TP (apenas display)
+    mode:          str = "native"   # "native" | "software"
+    status:        str = "active"   # "active" | "sl_hit" | "tp_hit" | "cancelled"
+    order_ids:     List[str] = field(default_factory=list)
+    created_at:    str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M"))
+    closed_at:     str = ""
+    closed_price:  float = 0.0
+
+
+class SLTPManager:
+    """
+    Gere proteções SL/TP para posições abertas.
+
+    Modos:
+      • native  — submete ordens bracket/OCO directamente na Alpaca.
+                  A corretora gere o cancelamento automaticamente.
+      • software — monitoriza preços em background e envia ordem
+                  de mercado quando SL ou TP é atingido.
+                  Útil quando a Alpaca não suporta bracket (ex: crypto).
+    """
+
+    def __init__(self, api: tradeapi.REST, interval: int = 15):
+        self.api      = api
+        self.interval = interval
+        self.guards:  List[SLTPGuard] = []
+        self._lock    = threading.Lock()
+        self._stop    = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._next_id = 1
+
+    # ── CÁLCULO DE PREÇOS ─────────────────────────────────────
+
+    @staticmethod
+    def calc_sl(entry: float, pct: float, side: str) -> float:
+        """Calcula preço de stop-loss a partir de percentagem."""
+        return round(entry * (1 - pct / 100) if side == "sell" else entry * (1 + pct / 100), 4)
+
+    @staticmethod
+    def calc_tp(entry: float, pct: float, side: str) -> float:
+        """Calcula preço de take-profit a partir de percentagem."""
+        return round(entry * (1 + pct / 100) if side == "sell" else entry * (1 - pct / 100), 4)
+
+    # ── SUBMISSÃO NATIVA (bracket order) ──────────────────────
+
+    def _submit_native(self, guard: SLTPGuard) -> bool:
+        """
+        Tenta submeter uma ordem bracket OCO na Alpaca.
+        Devolve True se tiver sucesso, False caso contrário.
+        """
+        try:
+            order_class = "oco" if (guard.stop_loss and guard.take_profit) else (
+                "stop"  if guard.stop_loss else "limit"
+            )
+
+            kwargs: dict = dict(
+                symbol=guard.symbol,
+                qty=guard.qty,
+                side=guard.side,
+                type="market",
+                time_in_force="gtc",
+                order_class=order_class,
+            )
+
+            if guard.stop_loss and guard.take_profit:
+                kwargs["stop_loss"]   = {"stop_price": str(round(guard.stop_loss, 2))}
+                kwargs["take_profit"] = {"limit_price": str(round(guard.take_profit, 2))}
+            elif guard.stop_loss:
+                kwargs["stop_loss"]   = {"stop_price": str(round(guard.stop_loss, 2))}
+            elif guard.take_profit:
+                kwargs["take_profit"] = {"limit_price": str(round(guard.take_profit, 2))}
+
+            order = self.api.submit_order(**kwargs)
+            guard.order_ids.append(order.id)
+            return True
+
+        except Exception as e:
+            console.print(f"  [yellow]⚠️  Modo nativo falhou ({e}). A usar modo software.[/yellow]")
+            return False
+
+    # ── ADICIONAR GUARD ───────────────────────────────────────
+
+    def add(
+        self,
+        symbol: str,
+        qty: str,
+        side: str,
+        entry_price: float,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
+        sl_pct: Optional[float] = None,
+        tp_pct: Optional[float] = None,
+        prefer_native: bool = True,
+    ) -> SLTPGuard:
+
+        guard = SLTPGuard(
+            id=self._next_id,
+            symbol=symbol.upper(),
+            qty=qty,
+            side=side,
+            entry_price=entry_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            sl_pct=sl_pct,
+            tp_pct=tp_pct,
+        )
+        self._next_id += 1
+
+        if prefer_native:
+            success = self._submit_native(guard)
+            guard.mode = "native" if success else "software"
+        else:
+            guard.mode = "software"
+
+        with self._lock:
+            self.guards.append(guard)
+
+        return guard
+
+    # ── CANCELAR GUARD ────────────────────────────────────────
+
+    def cancel(self, guard_id: int) -> bool:
+        with self._lock:
+            guard = next((g for g in self.guards if g.id == guard_id), None)
+            if not guard or guard.status != "active":
+                return False
+            guard.status = "cancelled"
+
+        # tenta cancelar ordens nativas pendentes
+        for oid in guard.order_ids:
+            try:
+                self.api.cancel_order(oid)
+            except Exception:
+                pass
+        return True
+
+    def list_guards(self) -> List[SLTPGuard]:
+        with self._lock:
+            return list(self.guards)
+
+    def clear_closed(self):
+        with self._lock:
+            self.guards = [g for g in self.guards if g.status == "active"]
+
+    # ── MONITOR SOFTWARE ──────────────────────────────────────
+
+    def _get_price(self, symbol: str) -> Optional[float]:
+        try:
+            bars = self.api.get_bars(symbol, tradeapi.TimeFrame.Minute, limit=1).df
+            if not bars.empty:
+                return float(bars.iloc[-1]["close"])
+        except Exception:
+            pass
+        return None
+
+    def _execute_close(self, guard: SLTPGuard, reason: str, price: float):
+        """Envia ordem de mercado para fechar posição (modo software)."""
+        try:
+            order = self.api.submit_order(
+                symbol=guard.symbol,
+                qty=guard.qty,
+                side=guard.side,
+                type="market",
+                time_in_force="gtc",
+            )
+            guard.order_ids.append(order.id)
+            guard.status       = reason          # "sl_hit" | "tp_hit"
+            guard.closed_at    = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            guard.closed_price = price
+
+            icon  = "🔴" if reason == "sl_hit" else "🟢"
+            label = "STOP-LOSS" if reason == "sl_hit" else "TAKE-PROFIT"
+            console.print(
+                f"\n  {icon} [bold]{'red' if reason == 'sl_hit' else 'green'}[/bold]"
+                f"[bold]{label} EXECUTADO![/bold]  "
+                f"[bold]{guard.symbol}[/bold]  "
+                f"Preço: [bold cyan]${price:,.2f}[/bold cyan]  "
+                f"Qty: {guard.qty}"
+            )
+        except Exception as e:
+            console.print(f"  [red]❌ Erro ao executar {reason} para {guard.symbol}: {e}[/red]")
+
+    def _check_software(self):
+        """Verifica guards em modo software."""
+        with self._lock:
+            sw_guards = [g for g in self.guards if g.mode == "software" and g.status == "active"]
+
+        symbols = list({g.symbol for g in sw_guards})
+        prices  = {s: self._get_price(s) for s in symbols}
+
+        for guard in sw_guards:
+            price = prices.get(guard.symbol)
+            if price is None:
+                continue
+
+            is_long = guard.side == "sell"  # posição long fecha com sell
+
+            if guard.stop_loss and (
+                (is_long  and price <= guard.stop_loss) or
+                (not is_long and price >= guard.stop_loss)
+            ):
+                self._execute_close(guard, "sl_hit", price)
+
+            elif guard.take_profit and (
+                (is_long  and price >= guard.take_profit) or
+                (not is_long and price <= guard.take_profit)
+            ):
+                self._execute_close(guard, "tp_hit", price)
+
+    def _run(self):
+        while not self._stop.is_set():
+            self._check_software()
+            self._stop.wait(self.interval)
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="SLTPMonitor")
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+
+
+# ── UI de SL/TP ───────────────────────────────────────────────
+
+def _fmt_status(status: str) -> str:
+    return {
+        "active":    "[cyan]⚡ Activo[/cyan]",
+        "sl_hit":    "[red]🔴 SL Exec.[/red]",
+        "tp_hit":    "[green]🟢 TP Exec.[/green]",
+        "cancelled": "[dim]❌ Cancelado[/dim]",
+    }.get(status, status)
+
+
+def show_sltp(manager: SLTPManager):
+    """Lista todas as proteções SL/TP."""
+    guards = manager.list_guards()
+
+    if not guards:
+        console.print("[yellow]Sem proteções SL/TP configuradas.[/yellow]")
+        return
+
+    table = Table(box=box.ROUNDED, border_style="magenta", header_style="bold magenta")
+    table.add_column("ID",      width=4,  justify="center")
+    table.add_column("Ticker",  width=8)
+    table.add_column("Qty",     width=6,  justify="right")
+    table.add_column("Entrada", width=10, justify="right")
+    table.add_column("Stop-Loss", width=14, justify="right")
+    table.add_column("Take-Profit", width=14, justify="right")
+    table.add_column("Modo",    width=10)
+    table.add_column("Estado",  width=14)
+
+    for g in guards:
+        sl_str = (
+            f"[red]${g.stop_loss:,.2f}[/red]"
+            + (f" [dim](-{g.sl_pct:.1f}%)[/dim]" if g.sl_pct else "")
+            if g.stop_loss else "[dim]—[/dim]"
+        )
+        tp_str = (
+            f"[green]${g.take_profit:,.2f}[/green]"
+            + (f" [dim](+{g.tp_pct:.1f}%)[/dim]" if g.tp_pct else "")
+            if g.take_profit else "[dim]—[/dim]"
+        )
+        mode_str = "[cyan]nativo[/cyan]" if g.mode == "native" else "[yellow]software[/yellow]"
+
+        table.add_row(
+            str(g.id),
+            g.symbol,
+            g.qty,
+            f"${g.entry_price:,.2f}",
+            sl_str,
+            tp_str,
+            mode_str,
+            _fmt_status(g.status),
+        )
+
+    activos = sum(1 for g in guards if g.status == "active")
+    console.print(Panel(
+        table,
+        title=f"[bold magenta]🛡️  Stop-Loss / Take-Profit  [dim]({activos} activos)[/dim][/bold magenta]",
+        border_style="magenta",
+    ))
+
+
+def add_sltp_ui(sltp_manager: SLTPManager, api: tradeapi.REST):
+    """Fluxo interactivo para configurar SL/TP numa posição."""
+    console.print(Rule("[bold magenta]🛡️  Novo Stop-Loss / Take-Profit[/bold magenta]"))
+
+    # mostra posições abertas para contexto
+    try:
+        positions = api.list_positions()
+    except Exception:
+        positions = []
+
+    if positions:
+        table = Table(box=box.SIMPLE, show_header=True, header_style="bold dim")
+        table.add_column("Ticker", width=8)
+        table.add_column("Qty",    width=8, justify="right")
+        table.add_column("Entrada", width=12, justify="right")
+        table.add_column("Actual",  width=12, justify="right")
+        table.add_column("P&L %",   width=10, justify="right")
+        for p in positions:
+            pl_pct = float(p.unrealized_plpc) * 100
+            table.add_row(
+                p.symbol, p.qty,
+                f"${float(p.avg_entry_price):,.2f}",
+                f"${float(p.current_price):,.2f}",
+                fmt_pct(pl_pct),
+            )
+        console.print(Panel(table, title="Posições abertas", border_style="dim"))
+    else:
+        console.print("[yellow]Sem posições abertas. Podes ainda configurar um SL/TP para uma ordem futura.[/yellow]")
+
+    # inputs
+    symbol = Prompt.ask("  Ticker").upper().strip()
+
+    # preenche entrada automaticamente se houver posição
+    entry_default = ""
+    pos_match = next((p for p in positions if p.symbol == symbol), None)
+    if pos_match:
+        entry_default = str(round(float(pos_match.avg_entry_price), 2))
+        qty_default   = pos_match.qty
+        side_default  = "sell" if float(pos_match.qty) > 0 else "buy"
+    else:
+        qty_default  = "1"
+        side_default = "sell"
+
+    entry_price = float(Prompt.ask("  Preço de entrada ($)", default=entry_default or "0"))
+    qty         = Prompt.ask("  Quantidade", default=qty_default)
+    side        = Prompt.ask("  Lado de fecho", choices=["sell", "buy"], default=side_default)
+
+    # SL
+    use_sl = Confirm.ask("  Configurar Stop-Loss?", default=True)
+    sl_price = sl_pct = None
+    if use_sl:
+        sl_mode = Prompt.ask("  Definir SL por", choices=["percentagem", "preço"], default="percentagem")
+        if sl_mode == "percentagem":
+            sl_pct   = float(Prompt.ask("  SL % abaixo da entrada", default="2.0"))
+            sl_price = SLTPManager.calc_sl(entry_price, sl_pct, side)
+            console.print(f"  → Stop-Loss: [red]${sl_price:,.2f}[/red]  [dim](-{sl_pct}%)[/dim]")
+        else:
+            sl_price = float(Prompt.ask("  Preço absoluto de SL ($)"))
+
+    # TP
+    use_tp = Confirm.ask("  Configurar Take-Profit?", default=True)
+    tp_price = tp_pct = None
+    if use_tp:
+        tp_mode = Prompt.ask("  Definir TP por", choices=["percentagem", "preço"], default="percentagem")
+        if tp_mode == "percentagem":
+            tp_pct   = float(Prompt.ask("  TP % acima da entrada", default="4.0"))
+            tp_price = SLTPManager.calc_tp(entry_price, tp_pct, side)
+            console.print(f"  → Take-Profit: [green]${tp_price:,.2f}[/green]  [dim](+{tp_pct}%)[/dim]")
+        else:
+            tp_price = float(Prompt.ask("  Preço absoluto de TP ($)"))
+
+    if not sl_price and not tp_price:
+        console.print("[yellow]Nenhum SL nem TP definido. Operação cancelada.[/yellow]")
+        return
+
+    # risco/recompensa
+    if sl_price and tp_price and entry_price:
+        risk   = abs(entry_price - sl_price)
+        reward = abs(tp_price - entry_price)
+        rr     = reward / risk if risk else 0
+        color  = "green" if rr >= 2 else "yellow" if rr >= 1 else "red"
+        console.print(
+            f"\n  📐 Risk/Reward: [{color}]{rr:.1f}R[/{color}]  "
+            f"[dim](Risco ${risk:,.2f}  →  Recompensa ${reward:,.2f})[/dim]"
+        )
+
+    prefer_native = Confirm.ask("  Usar ordens nativas da Alpaca? (recomendado)", default=True)
+
+    console.print()
+    if not Confirm.ask("  Confirmas a proteção?"):
+        console.print("[dim]Cancelado.[/dim]")
+        return
+
+    guard = sltp_manager.add(
+        symbol=symbol,
+        qty=qty,
+        side=side,
+        entry_price=entry_price,
+        stop_loss=sl_price,
+        take_profit=tp_price,
+        sl_pct=sl_pct,
+        tp_pct=tp_pct,
+        prefer_native=prefer_native,
+    )
+
+    console.print(
+        f"\n[green]✅ Proteção #{guard.id} activada![/green]  "
+        f"Modo: [cyan]{guard.mode}[/cyan]"
+        + (f"  IDs Alpaca: {', '.join(guard.order_ids)}" if guard.order_ids else "")
+    )
+
+
+def sltp_menu(sltp_manager: SLTPManager, api: tradeapi.REST):
+    """Submenu de gestão SL/TP."""
+    while True:
+        console.print(Rule("[bold magenta]🛡️  Stop-Loss / Take-Profit[/bold magenta]"))
+        console.print(
+            "  [bold cyan]1[/bold cyan] Ver proteções activas\n"
+            "  [bold cyan]2[/bold cyan] Nova proteção SL/TP\n"
+            "  [bold cyan]3[/bold cyan] Cancelar proteção\n"
+            "  [bold cyan]4[/bold cyan] Limpar encerradas\n"
+            "  [bold cyan]0[/bold cyan] Voltar\n"
+        )
+        op = Prompt.ask("  Opção", default="0").strip()
+
+        if op == "0":
+            break
+        elif op == "1":
+            show_sltp(sltp_manager)
+        elif op == "2":
+            add_sltp_ui(sltp_manager, api)
+        elif op == "3":
+            show_sltp(sltp_manager)
+            guards = sltp_manager.list_guards()
+            if not any(g.status == "active" for g in guards):
+                console.print("[yellow]Sem proteções activas para cancelar.[/yellow]")
+            else:
+                gid = Prompt.ask("  ID da proteção a cancelar").strip()
+                try:
+                    if sltp_manager.cancel(int(gid)):
+                        console.print(f"[green]✅ Proteção #{gid} cancelada.[/green]")
+                    else:
+                        console.print(f"[yellow]Proteção #{gid} não encontrada ou já inactiva.[/yellow]")
+                except ValueError:
+                    console.print("[red]ID inválido.[/red]")
+        elif op == "4":
+            sltp_manager.clear_closed()
+            console.print("[green]✅ Proteções encerradas removidas.[/green]")
+
+        console.print()
+        input("  ↩  Prima Enter para continuar…")
+
+
+# ══════════════════════════════════════════════════════════════
 #  MENU PRINCIPAL
 # ══════════════════════════════════════════════════════════════
 
 MENU_OPTIONS = {
-    "1": ("💰 Resumo da Conta",      "account"),
-    "2": ("📂 Posições Abertas",     "positions"),
-    "3": ("📋 Ordens Pendentes",     "orders"),
-    "4": ("➕ Nova Ordem",           "place"),
-    "5": ("❌ Cancelar Ordem",       "cancel"),
-    "6": ("📉 Cotação Rápida",       "quote"),
-    "7": ("📜 Histórico de Trades",  "history"),
-    "8": ("🔔 Alertas de Preço",     "alerts"),
-    "9": ("🤖 Assistente IA",        "ai"),
-    "0": ("🚪 Sair",                 "exit"),
+    "1":  ("💰 Resumo da Conta",           "account"),
+    "2":  ("📂 Posições Abertas",          "positions"),
+    "3":  ("📋 Ordens Pendentes",          "orders"),
+    "4":  ("➕ Nova Ordem",                "place"),
+    "5":  ("❌ Cancelar Ordem",            "cancel"),
+    "6":  ("📉 Cotação Rápida",            "quote"),
+    "7":  ("📜 Histórico de Trades",       "history"),
+    "8":  ("🔔 Alertas de Preço",          "alerts"),
+    "9":  ("🛡️  Stop-Loss / Take-Profit",  "sltp"),
+    "10": ("🤖 Assistente IA",             "ai"),
+    "0":  ("🚪 Sair",                      "exit"),
 }
 
 def print_menu():
@@ -712,6 +1170,11 @@ def main():
     alert_manager = AlertManager(api, interval=30)
     alert_manager.start()
     console.print("[green]✅ Monitor de alertas activo[/green]  [dim](intervalo: 30s)[/dim]")
+
+    # Iniciar gestor SL/TP em background (verifica a cada 15s)
+    sltp_manager = SLTPManager(api, interval=15)
+    sltp_manager.start()
+    console.print("[green]✅ Monitor SL/TP activo[/green]  [dim](intervalo: 15s)[/dim]")
     console.print()
 
     while True:
@@ -727,6 +1190,7 @@ def main():
 
         if action == "exit":
             alert_manager.stop()
+            sltp_manager.stop()
             console.print("[dim]Até logo! 👋[/dim]")
             break
         elif action == "account":
@@ -745,6 +1209,8 @@ def main():
             show_history(api)
         elif action == "alerts":
             alerts_menu(alert_manager)
+        elif action == "sltp":
+            sltp_menu(sltp_manager, api)
         elif action == "ai":
             if ai_client:
                 ai_assistant(ai_client, api)
