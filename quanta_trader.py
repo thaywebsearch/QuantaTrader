@@ -15,7 +15,7 @@ Funcionalidades:
   • Paper trading mode (sem dinheiro real)
 
 Dependências:
-  pip install alpaca-trade-api anthropic rich prompt_toolkit requests python-dotenv
+  pip install alpaca-trade-api anthropic rich prompt_toolkit requests python-dotenv pandas numpy
 
 Configuração (.env):
   ALPACA_API_KEY=...
@@ -1413,6 +1413,359 @@ def watchlist_menu(wl: Watchlist):
 
 
 # ══════════════════════════════════════════════════════════════
+#  MÓDULO: INDICADORES TÉCNICOS
+#  Implementados em pandas puro — sem ta-lib nem pandas-ta
+#  Indicadores: SMA, EMA, RSI, MACD, Bollinger Bands
+# ══════════════════════════════════════════════════════════════
+
+try:
+    import pandas as pd
+    import numpy as np
+    _PANDAS_OK = True
+except ImportError:
+    _PANDAS_OK = False
+
+
+# ── cálculo dos indicadores ───────────────────────────────────
+
+def _sma(series: "pd.Series", period: int) -> "pd.Series":
+    return series.rolling(window=period).mean()
+
+def _ema(series: "pd.Series", period: int) -> "pd.Series":
+    return series.ewm(span=period, adjust=False).mean()
+
+def _rsi(series: "pd.Series", period: int = 14) -> "pd.Series":
+    delta = series.diff()
+    gain  = delta.clip(lower=0).rolling(period).mean()
+    loss  = (-delta.clip(upper=0)).rolling(period).mean()
+    rs    = gain / loss.replace(0, float("nan"))
+    return 100 - (100 / (1 + rs))
+
+def _macd(series: "pd.Series", fast: int = 12, slow: int = 26, signal: int = 9):
+    ema_fast   = _ema(series, fast)
+    ema_slow   = _ema(series, slow)
+    macd_line  = ema_fast - ema_slow
+    signal_line = _ema(macd_line, signal)
+    histogram  = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
+def _bollinger(series: "pd.Series", period: int = 20, std_dev: float = 2.0):
+    mid   = _sma(series, period)
+    std   = series.rolling(period).std()
+    upper = mid + std_dev * std
+    lower = mid - std_dev * std
+    return upper, mid, lower
+
+def _fetch_ohlcv(api: tradeapi.REST, symbol: str, timeframe, limit: int) -> "Optional[pd.DataFrame]":
+    """Obtém dados OHLCV da Alpaca e devolve DataFrame com coluna 'close'."""
+    try:
+        bars = api.get_bars(symbol, timeframe, limit=limit).df
+        if bars.empty:
+            return None
+        bars.index = pd.to_datetime(bars.index)
+        return bars
+    except Exception as e:
+        console.print(f"  [red]Erro ao obter dados: {e}[/red]")
+        return None
+
+
+# ── display helpers ───────────────────────────────────────────
+
+def _rsi_color(v: float) -> str:
+    if v >= 70:  return "red"
+    if v <= 30:  return "green"
+    return "yellow"
+
+def _rsi_label(v: float) -> str:
+    if v >= 70:  return "Sobrecomprado ⚠️"
+    if v <= 30:  return "Sobrevendido  ✅"
+    return "Neutro"
+
+def _macd_signal(macd: float, sig: float) -> str:
+    if macd > sig:  return "[green]Alta (MACD > Signal)[/green]"
+    if macd < sig:  return "[red]Baixa (MACD < Signal)[/red]"
+    return "[yellow]Cruzamento[/yellow]"
+
+def _bb_position(price: float, upper: float, lower: float, mid: float) -> str:
+    width = upper - lower
+    if width == 0:
+        return "—"
+    pct = (price - lower) / width * 100
+    if price >= upper:  return f"[red]Acima da banda superior ({pct:.0f}%)[/red]"
+    if price <= lower:  return f"[green]Abaixo da banda inferior ({pct:.0f}%)[/green]"
+    if pct > 60:        return f"[yellow]Zona alta ({pct:.0f}%)[/yellow]"
+    if pct < 40:        return f"[yellow]Zona baixa ({pct:.0f}%)[/yellow]"
+    return f"[dim]Zona central ({pct:.0f}%)[/dim]"
+
+
+# ── display de cada indicador ─────────────────────────────────
+
+def _show_sma_ema(close: "pd.Series", current: float):
+    table = Table(box=box.SIMPLE_HEAD, header_style="bold dim", show_edge=False)
+    table.add_column("Período", width=10)
+    table.add_column("SMA",     width=12, justify="right")
+    table.add_column("EMA",     width=12, justify="right")
+    table.add_column("Preço vs SMA", width=18, justify="right")
+
+    for p in [9, 20, 50, 200]:
+        if len(close) < p:
+            continue
+        sma = _sma(close, p).iloc[-1]
+        ema = _ema(close, p).iloc[-1]
+        diff_pct = (current - sma) / sma * 100
+        diff_col = "green" if diff_pct >= 0 else "red"
+        sign     = "+" if diff_pct >= 0 else ""
+        table.add_row(
+            f"  {p}",
+            f"${sma:,.2f}",
+            f"${ema:,.2f}",
+            f"[{diff_col}]{sign}{diff_pct:.2f}%[/{diff_col}]",
+        )
+
+    console.print(Panel(table, title="[bold]📈 Médias Móveis (SMA / EMA)[/bold]", border_style="blue"))
+
+
+def _show_rsi(close: "pd.Series", period: int = 14):
+    rsi_series = _rsi(close, period)
+    val = rsi_series.iloc[-1]
+    color = _rsi_color(val)
+    label = _rsi_label(val)
+
+    # mini gráfico de barras dos últimos 14 valores
+    recent = rsi_series.dropna().tail(14).values
+    bar_chars = "▁▂▃▄▅▆▇█"
+    mini = ""
+    if len(recent) > 0:
+        mn, mx = min(recent), max(recent)
+        span   = mx - mn if mx != mn else 1
+        for v in recent:
+            idx  = int((v - mn) / span * 7)
+            c    = "green" if v <= 30 else "red" if v >= 70 else "yellow"
+            mini += f"[{c}]{bar_chars[idx]}[/{c}]"
+
+    console.print(Panel(
+        f"  RSI({period}):  [{color}][bold]{val:.1f}[/bold][/{color}]   {label}\n\n"
+        f"  Escala:  [green]≤30 Sobrevendido[/green]  ·  [yellow]30–70 Neutro[/yellow]  ·  [red]≥70 Sobrecomprado[/red]\n\n"
+        f"  Últimos 14:  {mini}",
+        title="[bold]📊 RSI — Relative Strength Index[/bold]",
+        border_style="yellow",
+    ))
+
+
+def _show_macd(close: "pd.Series", fast=12, slow=26, signal=9):
+    macd_line, sig_line, hist = _macd(close, fast, slow, signal)
+    m  = macd_line.iloc[-1]
+    s  = sig_line.iloc[-1]
+    h  = hist.iloc[-1]
+    h_color = "green" if h >= 0 else "red"
+    sign    = "+" if h >= 0 else ""
+
+    # mini histograma
+    recent_h = hist.dropna().tail(12).values
+    bar_chars = "▁▂▃▄▅▆▇█"
+    mini = ""
+    if len(recent_h) > 0:
+        mx = max(abs(v) for v in recent_h) or 1
+        for v in recent_h:
+            idx = int(abs(v) / mx * 7)
+            c   = "green" if v >= 0 else "red"
+            mini += f"[{c}]{bar_chars[idx]}[/{c}]"
+
+    console.print(Panel(
+        f"  MACD Line :  [cyan]{m:+.4f}[/cyan]\n"
+        f"  Signal    :  [magenta]{s:+.4f}[/magenta]\n"
+        f"  Histograma:  [{h_color}]{sign}{h:.4f}[/{h_color}]\n\n"
+        f"  Sinal     :  {_macd_signal(m, s)}\n\n"
+        f"  Histograma (12 barras):  {mini}",
+        title=f"[bold]📉 MACD ({fast},{slow},{signal})[/bold]",
+        border_style="magenta",
+    ))
+
+
+def _show_bollinger(close: "pd.Series", current: float, period=20, std_dev=2.0):
+    upper_s, mid_s, lower_s = _bollinger(close, period, std_dev)
+    upper = upper_s.iloc[-1]
+    mid   = mid_s.iloc[-1]
+    lower = lower_s.iloc[-1]
+    width_pct = (upper - lower) / mid * 100 if mid else 0
+
+    pos = _bb_position(current, upper, lower, mid)
+
+    console.print(Panel(
+        f"  Banda Superior:  [red]${upper:,.2f}[/red]\n"
+        f"  Banda Média  :  [cyan]${mid:,.2f}[/cyan]  [dim](SMA {period})[/dim]\n"
+        f"  Banda Inferior:  [green]${lower:,.2f}[/green]\n\n"
+        f"  Largura      :  {width_pct:.1f}%  [dim](volatilidade)[/dim]\n"
+        f"  Preço actual :  [bold]${current:,.2f}[/bold]  →  {pos}",
+        title=f"[bold]🎯 Bollinger Bands ({period}, {std_dev}σ)[/bold]",
+        border_style="red",
+    ))
+
+
+# ── menu de indicadores técnicos ──────────────────────────────
+
+TIMEFRAME_MAP = {
+    "1m":  (tradeapi.TimeFrame.Minute,  200),
+    "5m":  (tradeapi.TimeFrame.Minute,  200),   # Alpaca não tem 5m nativo; usa 1m e reamostras
+    "1h":  (tradeapi.TimeFrame.Hour,    300),
+    "1d":  (tradeapi.TimeFrame.Day,     300),
+}
+
+def technical_analysis(api: tradeapi.REST):
+    """Fluxo completo de análise técnica para um símbolo."""
+    if not _PANDAS_OK:
+        console.print(
+            "[red]❌  pandas e numpy são necessários para os indicadores técnicos.[/red]\n"
+            "  Instala com:  [bold]pip install pandas numpy[/bold]"
+        )
+        return
+
+    console.print(Rule("[bold green]📊 Análise Técnica[/bold green]"))
+
+    symbol = Prompt.ask("  Ticker (ex: AAPL, TSLA, BTC/USD)").upper().strip()
+    tf_key = Prompt.ask("  Timeframe", choices=["1m", "1h", "1d"], default="1d")
+
+    tf, limit = TIMEFRAME_MAP[tf_key]
+
+    with console.status(f"[cyan]A descarregar {limit} barras de {symbol} ({tf_key})…[/cyan]"):
+        df = _fetch_ohlcv(api, symbol, tf, limit)
+
+    if df is None or df.empty:
+        console.print(f"[red]Sem dados para {symbol}.[/red]")
+        return
+
+    close   = df["close"]
+    current = float(close.iloc[-1])
+    n_bars  = len(close)
+
+    console.print(
+        f"\n  [bold]{symbol}[/bold]  ·  Preço actual: [bold cyan]${current:,.2f}[/bold cyan]  "
+        f"·  {n_bars} barras ({tf_key})  "
+        f"·  {str(df.index[0])[:16]} → {str(df.index[-1])[:16]}\n"
+    )
+
+    # escolha de indicadores
+    console.print(
+        "  [bold cyan]1[/bold cyan] Todos os indicadores\n"
+        "  [bold cyan]2[/bold cyan] Médias Móveis (SMA / EMA)\n"
+        "  [bold cyan]3[/bold cyan] RSI\n"
+        "  [bold cyan]4[/bold cyan] MACD\n"
+        "  [bold cyan]5[/bold cyan] Bollinger Bands\n"
+    )
+    choice = Prompt.ask("  Indicadores", choices=["1","2","3","4","5"], default="1")
+
+    console.print()
+
+    if choice in ("1", "2"):
+        _show_sma_ema(close, current)
+        console.print()
+
+    if choice in ("1", "3"):
+        period = int(Prompt.ask("  Período RSI", default="14")) if choice == "3" else 14
+        _show_rsi(close, period)
+        console.print()
+
+    if choice in ("1", "4"):
+        _show_macd(close)
+        console.print()
+
+    if choice in ("1", "5"):
+        _show_bollinger(close, current)
+        console.print()
+
+    # resumo de sinais
+    if choice == "1":
+        _show_signal_summary(close, current)
+
+
+def _show_signal_summary(close: "pd.Series", current: float):
+    """Tabela de resumo de sinais — Comprar / Neutro / Vender."""
+    signals = []
+
+    # SMA 50
+    if len(close) >= 50:
+        sma50 = _sma(close, 50).iloc[-1]
+        signals.append(("SMA 50",
+            "COMPRAR" if current > sma50 else "VENDER",
+            f"Preço {'acima' if current > sma50 else 'abaixo'} da SMA50 (${sma50:,.2f})"
+        ))
+
+    # SMA 200
+    if len(close) >= 200:
+        sma200 = _sma(close, 200).iloc[-1]
+        signals.append(("SMA 200",
+            "COMPRAR" if current > sma200 else "VENDER",
+            f"Preço {'acima' if current > sma200 else 'abaixo'} da SMA200 (${sma200:,.2f})"
+        ))
+
+    # RSI
+    if len(close) >= 14:
+        rsi_val = _rsi(close, 14).iloc[-1]
+        if rsi_val >= 70:
+            signals.append(("RSI(14)", "VENDER",  f"Sobrecomprado: {rsi_val:.1f}"))
+        elif rsi_val <= 30:
+            signals.append(("RSI(14)", "COMPRAR", f"Sobrevendido: {rsi_val:.1f}"))
+        else:
+            signals.append(("RSI(14)", "NEUTRO",  f"Neutro: {rsi_val:.1f}"))
+
+    # MACD
+    if len(close) >= 35:
+        ml, sl, _ = _macd(close)
+        m, s = ml.iloc[-1], sl.iloc[-1]
+        signals.append(("MACD",
+            "COMPRAR" if m > s else "VENDER",
+            f"MACD {'>' if m > s else '<'} Signal ({m:+.4f} vs {s:+.4f})"
+        ))
+
+    # Bollinger
+    if len(close) >= 20:
+        u, _, l = _bollinger(close)
+        if current >= u.iloc[-1]:
+            signals.append(("Bollinger", "VENDER",  f"Preço acima da banda superior (${u.iloc[-1]:,.2f})"))
+        elif current <= l.iloc[-1]:
+            signals.append(("Bollinger", "COMPRAR", f"Preço abaixo da banda inferior (${l.iloc[-1]:,.2f})"))
+        else:
+            signals.append(("Bollinger", "NEUTRO",  "Dentro das bandas"))
+
+    if not signals:
+        return
+
+    # contagem
+    buys   = sum(1 for _, s, _ in signals if s == "COMPRAR")
+    sells  = sum(1 for _, s, _ in signals if s == "VENDER")
+    neutro = sum(1 for _, s, _ in signals if s == "NEUTRO")
+
+    table = Table(box=box.SIMPLE_HEAD, header_style="bold dim", show_edge=False)
+    table.add_column("Indicador", width=12)
+    table.add_column("Sinal",     width=12, justify="center")
+    table.add_column("Razão",     width=42)
+
+    for name, sig, reason in signals:
+        if sig == "COMPRAR":
+            sig_fmt = "[bold green]▲ COMPRAR[/bold green]"
+        elif sig == "VENDER":
+            sig_fmt = "[bold red]▼ VENDER[/bold red]"
+        else:
+            sig_fmt = "[yellow]─ NEUTRO[/yellow]"
+        table.add_row(f"  {name}", sig_fmt, f"[dim]{reason}[/dim]")
+
+    if buys > sells:
+        overall = f"[bold green]▲ TENDÊNCIA COMPRADORA  ({buys} comprar · {sells} vender · {neutro} neutro)[/bold green]"
+    elif sells > buys:
+        overall = f"[bold red]▼ TENDÊNCIA VENDEDORA  ({buys} comprar · {sells} vender · {neutro} neutro)[/bold red]"
+    else:
+        overall = f"[yellow]─ SINAL MISTO  ({buys} comprar · {sells} vender · {neutro} neutro)[/yellow]"
+
+    console.print(Panel(
+        table,
+        title="[bold]🧭 Resumo de Sinais[/bold]",
+        subtitle=overall,
+        border_style="dim",
+    ))
+    console.print("\n  [dim italic]⚠️  Indicadores técnicos são ferramentas de apoio à decisão, não garantias.[/dim italic]")
+
+
+# ══════════════════════════════════════════════════════════════
 #  MENU PRINCIPAL
 # ══════════════════════════════════════════════════════════════
 
@@ -1420,14 +1773,15 @@ MENU_OPTIONS = {
     "1":  ("💰 Resumo da Conta",           "account"),
     "2":  ("📂 Posições Abertas",          "positions"),
     "3":  ("📡 Watchlist ao Vivo",         "watchlist"),
-    "4":  ("📋 Ordens Pendentes",          "orders"),
-    "5":  ("➕ Nova Ordem",                "place"),
-    "6":  ("❌ Cancelar Ordem",            "cancel"),
-    "7":  ("📉 Cotação Rápida",            "quote"),
-    "8":  ("📜 Histórico de Trades",       "history"),
-    "9":  ("🔔 Alertas de Preço",          "alerts"),
-    "10": ("🛡️  Stop-Loss / Take-Profit",  "sltp"),
-    "11": ("🤖 Assistente IA",             "ai"),
+    "4":  ("📊 Indicadores Técnicos",      "technical"),
+    "5":  ("📋 Ordens Pendentes",          "orders"),
+    "6":  ("➕ Nova Ordem",                "place"),
+    "7":  ("❌ Cancelar Ordem",            "cancel"),
+    "8":  ("📉 Cotação Rápida",            "quote"),
+    "9":  ("📜 Histórico de Trades",       "history"),
+    "10": ("🔔 Alertas de Preço",          "alerts"),
+    "11": ("🛡️  Stop-Loss / Take-Profit",  "sltp"),
+    "12": ("🤖 Assistente IA",             "ai"),
     "0":  ("🚪 Sair",                      "exit"),
 }
 
@@ -1495,6 +1849,8 @@ def main():
             show_positions(api)
         elif action == "watchlist":
             watchlist_menu(watchlist)
+        elif action == "technical":
+            technical_analysis(api)
         elif action == "orders":
             show_open_orders(api)
         elif action == "place":
