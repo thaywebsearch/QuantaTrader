@@ -1766,6 +1766,435 @@ def _show_signal_summary(close: "pd.Series", current: float):
 
 
 # ══════════════════════════════════════════════════════════════
+#  MÓDULO: BACKTESTING SIMPLES
+#
+#  Estratégias disponíveis:
+#    1. SMA Crossover      — cruza SMA rápida com SMA lenta
+#    2. EMA Crossover      — cruza EMA rápida com EMA lenta
+#    3. RSI Mean-Reversion — compra em sobrevenda, vende em sobrecompra
+#    4. MACD Crossover     — cruza MACD com Signal line
+#    5. Bollinger Reversion— compra abaixo da banda inf., vende acima da sup.
+#
+#  Métricas calculadas:
+#    Total Return, Buy & Hold, CAGR, Sharpe Ratio, Max Drawdown,
+#    Win Rate, Profit Factor, nº trades, duração média
+# ══════════════════════════════════════════════════════════════
+
+@dataclass
+class Trade:
+    entry_date:  str
+    exit_date:   str
+    entry_price: float
+    exit_price:  float
+    direction:   str   # "long" | "short"
+    pnl:         float
+    pnl_pct:     float
+    bars_held:   int
+
+
+@dataclass
+class BacktestResult:
+    strategy:       str
+    symbol:         str
+    timeframe:      str
+    start_date:     str
+    end_date:       str
+    n_bars:         int
+    initial_capital: float
+    final_capital:  float
+    total_return:   float   # %
+    bh_return:      float   # % buy & hold
+    cagr:           float   # % anualizado
+    sharpe:         float
+    max_drawdown:   float   # %
+    win_rate:       float   # %
+    profit_factor:  float
+    n_trades:       int
+    avg_bars:       float
+    trades:         List[Trade] = field(default_factory=list)
+
+
+# ── motor de backtesting ──────────────────────────────────────
+
+def _run_backtest(
+    df:       "pd.DataFrame",
+    signals:  "pd.Series",   # +1 = comprar, -1 = vender, 0 = nada
+    capital:  float,
+    symbol:   str,
+    strategy: str,
+    timeframe: str,
+) -> BacktestResult:
+    """
+    Motor genérico de backtesting.
+    `signals` é uma Series alinhada com df onde:
+      +1 = abrir long (ou fechar short)
+      -1 = fechar long (ou abrir short)
+    Apenas long por simplicidade.
+    """
+    close      = df["close"].values
+    dates      = [str(i)[:16] for i in df.index]
+    position   = 0       # shares em carteira
+    cash       = capital
+    equity_curve: List[float] = []
+    trades:       List[Trade] = []
+    entry_price  = 0.0
+    entry_idx    = 0
+
+    sig_vals = signals.values
+
+    for i in range(len(close)):
+        price = close[i]
+
+        # abrir posição
+        if sig_vals[i] == 1 and position == 0:
+            position    = cash / price
+            entry_price = price
+            entry_idx   = i
+            cash        = 0.0
+
+        # fechar posição
+        elif sig_vals[i] == -1 and position > 0:
+            proceeds = position * price
+            pnl      = proceeds - (position * entry_price)
+            pnl_pct  = (price - entry_price) / entry_price * 100
+            trades.append(Trade(
+                entry_date  = dates[entry_idx],
+                exit_date   = dates[i],
+                entry_price = entry_price,
+                exit_price  = price,
+                direction   = "long",
+                pnl         = pnl,
+                pnl_pct     = pnl_pct,
+                bars_held   = i - entry_idx,
+            ))
+            cash     = proceeds
+            position = 0.0
+
+        # equity actual
+        equity_curve.append(cash + position * price)
+
+    # fechar posição aberta no final
+    if position > 0:
+        price    = close[-1]
+        proceeds = position * price
+        pnl      = proceeds - (position * entry_price)
+        pnl_pct  = (price - entry_price) / entry_price * 100
+        trades.append(Trade(
+            entry_date  = dates[entry_idx],
+            exit_date   = dates[-1],
+            entry_price = entry_price,
+            exit_price  = price,
+            direction   = "long",
+            pnl         = pnl,
+            pnl_pct     = pnl_pct,
+            bars_held   = len(close) - 1 - entry_idx,
+        ))
+        cash     = proceeds
+        position = 0.0
+        equity_curve[-1] = cash
+
+    import numpy as np
+
+    eq   = np.array(equity_curve) if equity_curve else np.array([capital])
+    final = float(eq[-1])
+
+    # métricas
+    total_ret = (final - capital) / capital * 100
+    bh_ret    = (close[-1] - close[0]) / close[0] * 100
+
+    # CAGR — estima anos com base no timeframe
+    tf_to_bars_per_year = {"1m": 252 * 390, "1h": 252 * 6.5, "1d": 252}
+    bpy   = tf_to_bars_per_year.get(timeframe, 252)
+    years = len(close) / bpy
+    cagr  = ((final / capital) ** (1 / max(years, 0.01)) - 1) * 100 if final > 0 else -100.0
+
+    # Sharpe (diário simplificado)
+    rets  = np.diff(eq) / eq[:-1]
+    sharpe = float(np.mean(rets) / np.std(rets) * np.sqrt(bpy)) if len(rets) > 1 and np.std(rets) > 0 else 0.0
+
+    # Max Drawdown
+    peak  = np.maximum.accumulate(eq)
+    dd    = (eq - peak) / peak * 100
+    max_dd = float(np.min(dd))
+
+    # Win rate & profit factor
+    winners = [t for t in trades if t.pnl > 0]
+    losers  = [t for t in trades if t.pnl <= 0]
+    win_rate = len(winners) / len(trades) * 100 if trades else 0.0
+    gross_profit = sum(t.pnl for t in winners)
+    gross_loss   = abs(sum(t.pnl for t in losers))
+    pf = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+    avg_bars = sum(t.bars_held for t in trades) / len(trades) if trades else 0.0
+
+    return BacktestResult(
+        strategy       = strategy,
+        symbol         = symbol,
+        timeframe      = timeframe,
+        start_date     = dates[0],
+        end_date       = dates[-1],
+        n_bars         = len(close),
+        initial_capital= capital,
+        final_capital  = final,
+        total_return   = total_ret,
+        bh_return      = bh_ret,
+        cagr           = cagr,
+        sharpe         = sharpe,
+        max_drawdown   = max_dd,
+        win_rate       = win_rate,
+        profit_factor  = pf,
+        n_trades       = len(trades),
+        avg_bars       = avg_bars,
+        trades         = trades,
+    )
+
+
+# ── estratégias → signals ─────────────────────────────────────
+
+def _strat_sma_cross(df: "pd.DataFrame", fast: int, slow: int) -> "pd.Series":
+    import pandas as pd
+    c  = df["close"]
+    sf = _sma(c, fast)
+    ss = _sma(c, slow)
+    sig = pd.Series(0, index=df.index)
+    cross_up   = (sf > ss) & (sf.shift(1) <= ss.shift(1))
+    cross_down = (sf < ss) & (sf.shift(1) >= ss.shift(1))
+    sig[cross_up]   =  1
+    sig[cross_down] = -1
+    return sig
+
+def _strat_ema_cross(df: "pd.DataFrame", fast: int, slow: int) -> "pd.Series":
+    import pandas as pd
+    c  = df["close"]
+    ef = _ema(c, fast)
+    es = _ema(c, slow)
+    sig = pd.Series(0, index=df.index)
+    cross_up   = (ef > es) & (ef.shift(1) <= es.shift(1))
+    cross_down = (ef < es) & (ef.shift(1) >= es.shift(1))
+    sig[cross_up]   =  1
+    sig[cross_down] = -1
+    return sig
+
+def _strat_rsi(df: "pd.DataFrame", period: int, oversold: float, overbought: float) -> "pd.Series":
+    import pandas as pd
+    rsi = _rsi(df["close"], period)
+    sig = pd.Series(0, index=df.index)
+    sig[rsi <= oversold]  =  1
+    sig[rsi >= overbought] = -1
+    return sig
+
+def _strat_macd(df: "pd.DataFrame", fast: int, slow: int, signal: int) -> "pd.Series":
+    import pandas as pd
+    ml, sl, _ = _macd(df["close"], fast, slow, signal)
+    sig = pd.Series(0, index=df.index)
+    cross_up   = (ml > sl) & (ml.shift(1) <= sl.shift(1))
+    cross_down = (ml < sl) & (ml.shift(1) >= sl.shift(1))
+    sig[cross_up]   =  1
+    sig[cross_down] = -1
+    return sig
+
+def _strat_bollinger(df: "pd.DataFrame", period: int, std_dev: float) -> "pd.Series":
+    import pandas as pd
+    c = df["close"]
+    upper, _, lower = _bollinger(c, period, std_dev)
+    sig = pd.Series(0, index=df.index)
+    sig[c <= lower] =  1
+    sig[c >= upper] = -1
+    return sig
+
+
+# ── display de resultados ─────────────────────────────────────
+
+def _show_backtest_result(r: BacktestResult, show_trades: bool = False):
+    """Painel de métricas do backtest."""
+
+    ret_color = "green" if r.total_return >= 0 else "red"
+    bh_color  = "green" if r.bh_return  >= 0 else "red"
+    vs_bh     = r.total_return - r.bh_return
+    vs_color  = "green" if vs_bh >= 0 else "red"
+    sharpe_c  = "green" if r.sharpe >= 1 else "yellow" if r.sharpe >= 0 else "red"
+    dd_color  = "green" if r.max_drawdown > -10 else "yellow" if r.max_drawdown > -20 else "red"
+    pf_color  = "green" if r.profit_factor >= 1.5 else "yellow" if r.profit_factor >= 1 else "red"
+    wr_color  = "green" if r.win_rate >= 55 else "yellow" if r.win_rate >= 45 else "red"
+
+    # tabela de métricas
+    mt = Table(box=box.SIMPLE, show_header=False, show_edge=False, padding=(0, 2))
+    mt.add_column("Métrica",  style="bold dim", width=24)
+    mt.add_column("Valor",    justify="right",  width=18)
+    mt.add_column("Métrica2", style="bold dim", width=24)
+    mt.add_column("Valor2",   justify="right",  width=18)
+
+    rows = [
+        ("Capital Inicial",   f"${r.initial_capital:,.2f}",
+         "Capital Final",     f"[{ret_color}]${r.final_capital:,.2f}[/{ret_color}]"),
+        ("Retorno Estratégia",f"[{ret_color}]{r.total_return:+.2f}%[/{ret_color}]",
+         "Buy & Hold",        f"[{bh_color}]{r.bh_return:+.2f}%[/{bh_color}]"),
+        ("Alpha vs B&H",      f"[{vs_color}]{vs_bh:+.2f}%[/{vs_color}]",
+         "CAGR",              f"[{ret_color}]{r.cagr:+.2f}%[/{ret_color}]"),
+        ("Sharpe Ratio",      f"[{sharpe_c}]{r.sharpe:.2f}[/{sharpe_c}]",
+         "Max Drawdown",      f"[{dd_color}]{r.max_drawdown:.2f}%[/{dd_color}]"),
+        ("Win Rate",          f"[{wr_color}]{r.win_rate:.1f}%[/{wr_color}]",
+         "Profit Factor",     f"[{pf_color}]{r.profit_factor:.2f}[/{pf_color}]"),
+        ("Nº Trades",         str(r.n_trades),
+         "Duração Média",     f"{r.avg_bars:.0f} barras"),
+        ("Período",           f"{r.start_date[:10]} → {r.end_date[:10]}",
+         "Barras",            str(r.n_bars)),
+    ]
+    for r1, v1, r2, v2 in rows:
+        mt.add_row(r1, v1, r2, v2)
+
+    console.print(Panel(
+        mt,
+        title=f"[bold green]🧪 Backtest — {r.strategy}  ·  {r.symbol}  ·  {r.timeframe}[/bold green]",
+        border_style="green",
+    ))
+
+    # avaliação qualitativa
+    score = 0
+    tips  = []
+    if r.total_return > r.bh_return:   score += 1
+    else:                              tips.append("[yellow]• Estratégia ficou abaixo do Buy & Hold.[/yellow]")
+    if r.sharpe >= 1.0:                score += 1
+    else:                              tips.append("[yellow]• Sharpe < 1.0 — risco/retorno fraco.[/yellow]")
+    if r.max_drawdown > -20:           score += 1
+    else:                              tips.append("[yellow]• Drawdown elevado — considera SL mais apertado.[/yellow]")
+    if r.win_rate >= 50:               score += 1
+    else:                              tips.append("[yellow]• Win rate < 50% — verifica os parâmetros.[/yellow]")
+    if r.profit_factor >= 1.5:         score += 1
+    else:                              tips.append("[yellow]• Profit factor < 1.5 — ganhos médios baixos.[/yellow]")
+
+    stars   = "★" * score + "☆" * (5 - score)
+    s_color = "green" if score >= 4 else "yellow" if score >= 2 else "red"
+    console.print(f"  Avaliação: [{s_color}]{stars}[/{s_color}]  ({score}/5)")
+    for tip in tips:
+        console.print(f"  {tip}")
+
+    # lista de trades (opcional)
+    if show_trades and r.trades:
+        console.print()
+        tt = Table(box=box.SIMPLE_HEAD, header_style="bold dim", show_edge=False)
+        tt.add_column("#",          width=4,  justify="right")
+        tt.add_column("Entrada",    width=14)
+        tt.add_column("Saída",      width=14)
+        tt.add_column("P. Entrada", width=12, justify="right")
+        tt.add_column("P. Saída",   width=12, justify="right")
+        tt.add_column("P&L $",      width=12, justify="right")
+        tt.add_column("P&L %",      width=10, justify="right")
+        tt.add_column("Barras",     width=8,  justify="right")
+
+        for i, t in enumerate(r.trades, 1):
+            c = "green" if t.pnl >= 0 else "red"
+            tt.add_row(
+                str(i),
+                t.entry_date, t.exit_date,
+                f"${t.entry_price:,.2f}", f"${t.exit_price:,.2f}",
+                f"[{c}]{t.pnl:+,.2f}[/{c}]",
+                f"[{c}]{t.pnl_pct:+.2f}%[/{c}]",
+                str(t.bars_held),
+            )
+
+        console.print(Panel(tt, title="[dim]📋 Lista de Trades[/dim]", border_style="dim"))
+
+    console.print("\n  [dim italic]⚠️  Resultados passados não garantem performance futura.[/dim italic]")
+
+
+# ── menu de backtesting ───────────────────────────────────────
+
+STRATEGIES = {
+    "1": "SMA Crossover",
+    "2": "EMA Crossover",
+    "3": "RSI Mean-Reversion",
+    "4": "MACD Crossover",
+    "5": "Bollinger Reversion",
+}
+
+def backtesting_menu(api: tradeapi.REST):
+    """Fluxo completo de backtesting."""
+    if not _PANDAS_OK:
+        console.print(
+            "[red]❌  pandas e numpy são necessários para o backtesting.[/red]\n"
+            "  Instala com:  [bold]pip install pandas numpy[/bold]"
+        )
+        return
+
+    while True:
+        console.print(Rule("[bold green]🧪 Backtesting[/bold green]"))
+        console.print(
+            "  [bold cyan]1[/bold cyan] SMA Crossover\n"
+            "  [bold cyan]2[/bold cyan] EMA Crossover\n"
+            "  [bold cyan]3[/bold cyan] RSI Mean-Reversion\n"
+            "  [bold cyan]4[/bold cyan] MACD Crossover\n"
+            "  [bold cyan]5[/bold cyan] Bollinger Reversion\n"
+            "  [bold cyan]0[/bold cyan] Voltar\n"
+        )
+        choice = Prompt.ask("  Estratégia", default="0").strip()
+        if choice == "0":
+            break
+        if choice not in STRATEGIES:
+            console.print("[yellow]Opção inválida.[/yellow]")
+            continue
+
+        strat = STRATEGIES[choice]
+        console.print(Rule(f"[dim]{strat}[/dim]"))
+
+        # parâmetros comuns
+        symbol  = Prompt.ask("  Ticker (ex: AAPL, SPY)").upper().strip()
+        tf_key  = Prompt.ask("  Timeframe", choices=["1m","1h","1d"], default="1d")
+        limit   = int(Prompt.ask("  Nº de barras históricas", default="500"))
+        capital = float(Prompt.ask("  Capital inicial ($)", default="10000"))
+
+        # parâmetros específicos por estratégia
+        params: dict = {}
+        if choice == "1":
+            params["fast"] = int(Prompt.ask("  SMA rápida (períodos)", default="20"))
+            params["slow"] = int(Prompt.ask("  SMA lenta  (períodos)", default="50"))
+        elif choice == "2":
+            params["fast"] = int(Prompt.ask("  EMA rápida (períodos)", default="12"))
+            params["slow"] = int(Prompt.ask("  EMA lenta  (períodos)", default="26"))
+        elif choice == "3":
+            params["period"]     = int(Prompt.ask("  Período RSI", default="14"))
+            params["oversold"]   = float(Prompt.ask("  Nível sobrevenda", default="30"))
+            params["overbought"] = float(Prompt.ask("  Nível sobrecompra", default="70"))
+        elif choice == "4":
+            params["fast"]   = int(Prompt.ask("  MACD rápido", default="12"))
+            params["slow"]   = int(Prompt.ask("  MACD lento",  default="26"))
+            params["signal"] = int(Prompt.ask("  Signal line", default="9"))
+        elif choice == "5":
+            params["period"]  = int(Prompt.ask("  Período Bollinger", default="20"))
+            params["std_dev"] = float(Prompt.ask("  Desvios padrão",  default="2.0"))
+
+        tf, _ = TIMEFRAME_MAP[tf_key]
+
+        with console.status(f"[cyan]A descarregar {limit} barras de {symbol}…[/cyan]"):
+            df = _fetch_ohlcv(api, symbol, tf, limit)
+
+        if df is None or df.empty:
+            console.print(f"[red]Sem dados para {symbol}.[/red]")
+        else:
+            with console.status("[cyan]A correr backtest…[/cyan]"):
+                if choice == "1":
+                    sigs = _strat_sma_cross(df, params["fast"], params["slow"])
+                elif choice == "2":
+                    sigs = _strat_ema_cross(df, params["fast"], params["slow"])
+                elif choice == "3":
+                    sigs = _strat_rsi(df, params["period"], params["oversold"], params["overbought"])
+                elif choice == "4":
+                    sigs = _strat_macd(df, params["fast"], params["slow"], params["signal"])
+                else:
+                    sigs = _strat_bollinger(df, params["period"], params["std_dev"])
+
+                result = _run_backtest(df, sigs, capital, symbol, strat, tf_key)
+
+            console.print()
+            show_trades = Confirm.ask("  Mostrar lista de trades individuais?", default=False)
+            _show_backtest_result(result, show_trades=show_trades)
+
+        console.print()
+        if not Confirm.ask("  Correr outro backtest?", default=False):
+            break
+        console.print()
+
+
+# ══════════════════════════════════════════════════════════════
 #  MENU PRINCIPAL
 # ══════════════════════════════════════════════════════════════
 
@@ -1774,14 +2203,15 @@ MENU_OPTIONS = {
     "2":  ("📂 Posições Abertas",          "positions"),
     "3":  ("📡 Watchlist ao Vivo",         "watchlist"),
     "4":  ("📊 Indicadores Técnicos",      "technical"),
-    "5":  ("📋 Ordens Pendentes",          "orders"),
-    "6":  ("➕ Nova Ordem",                "place"),
-    "7":  ("❌ Cancelar Ordem",            "cancel"),
-    "8":  ("📉 Cotação Rápida",            "quote"),
-    "9":  ("📜 Histórico de Trades",       "history"),
-    "10": ("🔔 Alertas de Preço",          "alerts"),
-    "11": ("🛡️  Stop-Loss / Take-Profit",  "sltp"),
-    "12": ("🤖 Assistente IA",             "ai"),
+    "5":  ("🧪 Backtesting",               "backtest"),
+    "6":  ("📋 Ordens Pendentes",          "orders"),
+    "7":  ("➕ Nova Ordem",                "place"),
+    "8":  ("❌ Cancelar Ordem",            "cancel"),
+    "9":  ("📉 Cotação Rápida",            "quote"),
+    "10": ("📜 Histórico de Trades",       "history"),
+    "11": ("🔔 Alertas de Preço",          "alerts"),
+    "12": ("🛡️  Stop-Loss / Take-Profit",  "sltp"),
+    "13": ("🤖 Assistente IA",             "ai"),
     "0":  ("🚪 Sair",                      "exit"),
 }
 
@@ -1851,6 +2281,8 @@ def main():
             watchlist_menu(watchlist)
         elif action == "technical":
             technical_analysis(api)
+        elif action == "backtest":
+            backtesting_menu(api)
         elif action == "orders":
             show_open_orders(api)
         elif action == "place":
