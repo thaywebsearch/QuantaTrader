@@ -2195,24 +2195,477 @@ def backtesting_menu(api: tradeapi.REST):
 
 
 # ══════════════════════════════════════════════════════════════
+#  MÓDULO: ANÁLISE DE RISCO & POSITION SIZING
+#
+#  Modelos de position sizing:
+#    1. Risco Fixo por Trade    — % do capital em risco
+#    2. Kelly Criterion         — fracção óptima baseada em win rate / R:R
+#    3. ATR-Based Sizing        — stop dinâmico baseado na volatilidade
+#    4. Volatility Targeting    — ajusta tamanho para atingir vol. alvo
+#
+#  Extras:
+#    • Análise de correlação entre posições abertas
+#    • Concentração de portfolio por posição
+#    • Simulação Monte Carlo de trajectórias de capital
+# ══════════════════════════════════════════════════════════════
+
+# ── modelos de position sizing ────────────────────────────────
+
+@dataclass
+class SizeResult:
+    model:         str
+    symbol:        str
+    entry_price:   float
+    stop_price:    float
+    capital:       float
+    risk_amount:   float      # $ em risco
+    risk_pct:      float      # % do capital
+    shares:        float      # quantidade a comprar
+    position_value: float     # valor total da posição
+    position_pct:  float      # % do capital alocado
+    rr_ratio:      Optional[float] = None
+    target_price:  Optional[float] = None
+    notes:         str = ""
+
+
+def _atr(df: "pd.DataFrame", period: int = 14) -> "pd.Series":
+    """Average True Range."""
+    import pandas as pd
+    h, l, c = df["high"], df["low"], df["close"]
+    tr = pd.concat([
+        h - l,
+        (h - c.shift(1)).abs(),
+        (l - c.shift(1)).abs(),
+    ], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
+
+
+def _model_fixed_risk(
+    capital: float, risk_pct: float,
+    entry: float, stop: float,
+    target: Optional[float] = None,
+) -> SizeResult:
+    """Risco fixo: arrisca X% do capital por trade."""
+    risk_amount  = capital * risk_pct / 100
+    risk_per_shr = abs(entry - stop)
+    shares       = risk_amount / risk_per_shr if risk_per_shr > 0 else 0
+    pos_val      = shares * entry
+    pos_pct      = pos_val / capital * 100
+    rr = abs(target - entry) / risk_per_shr if target and risk_per_shr > 0 else None
+    return SizeResult(
+        model="Risco Fixo",
+        symbol="", entry_price=entry, stop_price=stop,
+        capital=capital, risk_amount=risk_amount, risk_pct=risk_pct,
+        shares=shares, position_value=pos_val, position_pct=pos_pct,
+        rr_ratio=rr, target_price=target,
+        notes=f"Risco de ${risk_amount:,.2f} por trade ({risk_pct}% do capital)",
+    )
+
+
+def _model_kelly(
+    capital: float, win_rate: float, avg_win_pct: float, avg_loss_pct: float,
+    entry: float, stop: float,
+) -> SizeResult:
+    """Kelly Criterion: fracção óptima f* = W/L - (1-W)/W_pct."""
+    w   = win_rate / 100
+    b   = avg_win_pct / avg_loss_pct if avg_loss_pct > 0 else 1
+    kelly_full = w - (1 - w) / b if b > 0 else 0
+    kelly_half = max(kelly_full / 2, 0)   # half-Kelly para segurança
+    risk_amount  = capital * kelly_half
+    risk_per_shr = abs(entry - stop)
+    shares       = risk_amount / risk_per_shr if risk_per_shr > 0 else 0
+    pos_val      = shares * entry
+    pos_pct      = pos_val / capital * 100
+    note = (
+        f"Kelly completo: {kelly_full*100:.1f}%  →  Half-Kelly: {kelly_half*100:.1f}%"
+        if kelly_full > 0 else "Kelly negativo — estratégia desfavorável com estes parâmetros"
+    )
+    return SizeResult(
+        model="Kelly Criterion (Half)",
+        symbol="", entry_price=entry, stop_price=stop,
+        capital=capital, risk_amount=risk_amount, risk_pct=kelly_half * 100,
+        shares=shares, position_value=pos_val, position_pct=pos_pct,
+        notes=note,
+    )
+
+
+def _model_atr(
+    api: tradeapi.REST, symbol: str,
+    capital: float, risk_pct: float, entry: float,
+    atr_mult: float = 2.0, period: int = 14,
+) -> SizeResult:
+    """ATR-Based: stop = entry - N × ATR."""
+    try:
+        df = _fetch_ohlcv(api, symbol, tradeapi.TimeFrame.Day, 60)
+        if df is None or df.empty:
+            raise ValueError("sem dados")
+        atr_val   = float(_atr(df, period).iloc[-1])
+        stop      = entry - atr_mult * atr_val
+        risk_per  = entry - stop
+        risk_amt  = capital * risk_pct / 100
+        shares    = risk_amt / risk_per if risk_per > 0 else 0
+        pos_val   = shares * entry
+        pos_pct   = pos_val / capital * 100
+        return SizeResult(
+            model="ATR-Based",
+            symbol=symbol, entry_price=entry, stop_price=stop,
+            capital=capital, risk_amount=risk_amt, risk_pct=risk_pct,
+            shares=shares, position_value=pos_val, position_pct=pos_pct,
+            notes=f"ATR({period}) = ${atr_val:.2f}  ·  Stop = Entrada − {atr_mult}×ATR = ${stop:.2f}",
+        )
+    except Exception as e:
+        return SizeResult(
+            model="ATR-Based", symbol=symbol, entry_price=entry, stop_price=entry * 0.98,
+            capital=capital, risk_amount=0, risk_pct=0,
+            shares=0, position_value=0, position_pct=0,
+            notes=f"Erro ao calcular ATR: {e}",
+        )
+
+
+def _model_vol_target(
+    api: tradeapi.REST, symbol: str,
+    capital: float, vol_target_pct: float, entry: float,
+) -> SizeResult:
+    """Volatility Targeting: ajusta posição para atingir vol. anual alvo."""
+    try:
+        import numpy as np
+        df   = _fetch_ohlcv(api, symbol, tradeapi.TimeFrame.Day, 60)
+        if df is None or df.empty:
+            raise ValueError("sem dados")
+        rets     = df["close"].pct_change().dropna()
+        daily_vol = float(rets.std())
+        ann_vol   = daily_vol * (252 ** 0.5) * 100
+        weight    = vol_target_pct / ann_vol if ann_vol > 0 else 0
+        weight    = min(weight, 1.0)           # cap a 100% do capital
+        pos_val   = capital * weight
+        shares    = pos_val / entry
+        risk_per  = entry * daily_vol * 2      # ~2σ daily como proxy de risco
+        risk_amt  = shares * risk_per
+        stop      = entry - risk_per
+        return SizeResult(
+            model="Volatility Targeting",
+            symbol=symbol, entry_price=entry, stop_price=stop,
+            capital=capital, risk_amount=risk_amt, risk_pct=risk_amt / capital * 100,
+            shares=shares, position_value=pos_val, position_pct=weight * 100,
+            notes=(
+                f"Vol. histórica anual: {ann_vol:.1f}%  ·  "
+                f"Alvo: {vol_target_pct}%  ·  "
+                f"Peso: {weight*100:.1f}% do capital"
+            ),
+        )
+    except Exception as e:
+        return SizeResult(
+            model="Volatility Targeting", symbol=symbol, entry_price=entry, stop_price=0,
+            capital=capital, risk_amount=0, risk_pct=0,
+            shares=0, position_value=0, position_pct=0,
+            notes=f"Erro: {e}",
+        )
+
+
+# ── display de result ─────────────────────────────────────────
+
+def _show_size_result(r: SizeResult):
+    pos_color = "green" if r.position_pct <= 20 else "yellow" if r.position_pct <= 40 else "red"
+    rsk_color = "green" if r.risk_pct <= 2 else "yellow" if r.risk_pct <= 5 else "red"
+
+    lines = [
+        f"  [bold]Modelo:[/bold]           {r.model}",
+        f"  [bold]Capital:[/bold]          ${r.capital:>12,.2f}",
+        f"  [bold]Preço de Entrada:[/bold] ${r.entry_price:>12,.2f}",
+        f"  [bold]Preço de Stop:[/bold]    [red]${r.stop_price:>12,.2f}[/red]",
+    ]
+    if r.target_price:
+        lines.append(f"  [bold]Preço Alvo (TP):[/bold]  [green]${r.target_price:>12,.2f}[/green]")
+    if r.rr_ratio is not None:
+        rr_c = "green" if r.rr_ratio >= 2 else "yellow" if r.rr_ratio >= 1 else "red"
+        lines.append(f"  [bold]Risk/Reward:[/bold]      [{rr_c}]{r.rr_ratio:.2f}R[/{rr_c}]")
+
+    lines += [
+        "",
+        f"  [bold]Quantidade:[/bold]       [bold cyan]{r.shares:.4f}[/bold cyan]  shares / unidades",
+        f"  [bold]Valor Posição:[/bold]    [bold cyan]${r.position_value:>12,.2f}[/bold cyan]",
+        f"  [bold]% do Capital:[/bold]     [{pos_color}]{r.position_pct:.1f}%[/{pos_color}]",
+        f"  [bold]Risco $:[/bold]          [{rsk_color}]${r.risk_amount:>12,.2f}[/{rsk_color}]",
+        f"  [bold]Risco %:[/bold]          [{rsk_color}]{r.risk_pct:.2f}%[/{rsk_color}]",
+        "",
+        f"  [dim]{r.notes}[/dim]",
+    ]
+
+    console.print(Panel(
+        "\n".join(lines),
+        title=f"[bold magenta]📐 Position Sizing — {r.model}[/bold magenta]",
+        border_style="magenta",
+    ))
+
+    # avisos de concentração
+    if r.position_pct > 40:
+        console.print("  [red]⚠️  Posição > 40% do capital — risco de concentração elevado.[/red]")
+    if r.risk_pct > 5:
+        console.print("  [red]⚠️  Risco por trade > 5% — considera reduzir o stop ou o tamanho.[/red]")
+    if r.rr_ratio is not None and r.rr_ratio < 1:
+        console.print("  [red]⚠️  Risk/Reward < 1 — potencial ganho inferior ao risco assumido.[/red]")
+
+
+# ── análise do portfolio ──────────────────────────────────────
+
+def _show_portfolio_risk(api: tradeapi.REST):
+    """Análise de concentração e risco do portfolio actual."""
+    try:
+        positions = api.list_positions()
+        acct      = api.get_account()
+    except Exception as e:
+        console.print(f"[red]Erro: {e}[/red]")
+        return
+
+    if not positions:
+        console.print("[yellow]Sem posições abertas.[/yellow]")
+        return
+
+    equity = float(acct.equity)
+    total_exposure = sum(abs(float(p.market_value)) for p in positions)
+
+    table = Table(box=box.ROUNDED, border_style="magenta", header_style="bold magenta")
+    table.add_column("Ticker",       width=8)
+    table.add_column("Valor",        width=12, justify="right")
+    table.add_column("% Portfolio",  width=13, justify="right")
+    table.add_column("P&L $",        width=12, justify="right")
+    table.add_column("P&L %",        width=10, justify="right")
+    table.add_column("Risco (2%SL)", width=14, justify="right")
+    table.add_column("Concentração", width=14)
+
+    for p in positions:
+        val    = abs(float(p.market_value))
+        pct    = val / equity * 100
+        pl     = float(p.unrealized_pl)
+        pl_pct = float(p.unrealized_plpc) * 100
+        risk2  = val * 0.02        # risco implícito com SL de 2%
+
+        if pct > 30:
+            conc = "[red]Alta ⚠️[/red]"
+        elif pct > 15:
+            conc = "[yellow]Média[/yellow]"
+        else:
+            conc = "[green]Normal[/green]"
+
+        table.add_row(
+            p.symbol,
+            f"${val:,.2f}",
+            f"{pct:.1f}%",
+            fmt_money(pl),
+            fmt_pct(pl_pct),
+            f"[red]${risk2:,.2f}[/red]",
+            conc,
+        )
+
+    # linha de totais
+    total_pl = sum(float(p.unrealized_pl) for p in positions)
+    table.add_section()
+    table.add_row(
+        "[bold]TOTAL[/bold]",
+        f"[bold]${total_exposure:,.2f}[/bold]",
+        f"[bold]{total_exposure/equity*100:.1f}%[/bold]",
+        fmt_money(total_pl),
+        fmt_pct(total_pl / equity * 100),
+        "", "",
+    )
+
+    herfindahl = sum((abs(float(p.market_value)) / total_exposure * 100) ** 2 for p in positions) / 100
+    diversif   = "Alta" if herfindahl < 10 else "Média" if herfindahl < 25 else "Baixa"
+    div_color  = "green" if herfindahl < 10 else "yellow" if herfindahl < 25 else "red"
+
+    console.print(Panel(
+        table,
+        title="[bold magenta]📊 Análise de Risco do Portfolio[/bold magenta]",
+        subtitle=f"  Diversificação: [{div_color}]{diversif}[/{div_color}]  [dim](HHI={herfindahl:.1f})[/dim]",
+        border_style="magenta",
+    ))
+
+
+# ── simulação Monte Carlo ─────────────────────────────────────
+
+def _monte_carlo(api: tradeapi.REST, symbol: str, capital: float, days: int, sims: int = 500):
+    """Simula trajectórias de capital por Monte Carlo com retornos históricos."""
+    if not _PANDAS_OK:
+        return
+
+    import numpy as np
+
+    with console.status(f"[cyan]A simular {sims} trajectórias de {days} dias…[/cyan]"):
+        df = _fetch_ohlcv(api, symbol, tradeapi.TimeFrame.Day, 252)
+        if df is None or df.empty:
+            console.print("[red]Sem dados para simulação.[/red]")
+            return
+
+        rets   = df["close"].pct_change().dropna().values
+        mu     = float(np.mean(rets))
+        sigma  = float(np.std(rets))
+
+        results = []
+        for _ in range(sims):
+            daily  = np.random.normal(mu, sigma, days)
+            path   = capital * np.cumprod(1 + daily)
+            results.append(float(path[-1]))
+
+        results = sorted(results)
+        p5   = float(np.percentile(results, 5))
+        p25  = float(np.percentile(results, 25))
+        p50  = float(np.percentile(results, 50))
+        p75  = float(np.percentile(results, 75))
+        p95  = float(np.percentile(results, 95))
+        prob_loss = sum(1 for r in results if r < capital) / sims * 100
+
+    # mini histograma ASCII
+    buckets    = 20
+    mn, mx     = results[0], results[-1]
+    span       = mx - mn if mx != mn else 1
+    hist       = [0] * buckets
+    for v in results:
+        idx = min(int((v - mn) / span * buckets), buckets - 1)
+        hist[idx] += 1
+    max_h  = max(hist) or 1
+    bars   = "▁▂▃▄▅▆▇█"
+    mini_h = ""
+    for h in hist:
+        idx  = int(h / max_h * 7)
+        pv   = mn + (hist.index(h) / buckets) * span
+        c    = "green" if pv >= capital else "red"
+        mini_h += f"[{c}]{bars[idx]}[/{c}]"
+
+    ret_50 = (p50 - capital) / capital * 100
+    r_color = "green" if ret_50 >= 0 else "red"
+
+    console.print(Panel(
+        f"  [bold]{symbol}[/bold]  ·  {sims} simulações  ·  {days} dias  ·  Capital: ${capital:,.2f}\n\n"
+        f"  P5  (pessimista):  [red]${p5:>12,.2f}[/red]  ({(p5-capital)/capital*100:+.1f}%)\n"
+        f"  P25              : [yellow]${p25:>12,.2f}[/yellow]  ({(p25-capital)/capital*100:+.1f}%)\n"
+        f"  P50 (mediana)    : [{r_color}]${p50:>12,.2f}[/{r_color}]  ({ret_50:+.1f}%)\n"
+        f"  P75              : [green]${p75:>12,.2f}[/green]  ({(p75-capital)/capital*100:+.1f}%)\n"
+        f"  P95 (optimista)  : [green]${p95:>12,.2f}[/green]  ({(p95-capital)/capital*100:+.1f}%)\n\n"
+        f"  Probabilidade de perda: [{'red' if prob_loss>40 else 'yellow' if prob_loss>20 else 'green'}]{prob_loss:.1f}%[/]\n\n"
+        f"  Distribuição: {mini_h}",
+        title="[bold magenta]🎲 Simulação Monte Carlo[/bold magenta]",
+        border_style="magenta",
+    ))
+
+
+# ── menu principal de risco ───────────────────────────────────
+
+def risk_menu(api: tradeapi.REST):
+    """Menu de análise de risco e position sizing."""
+    while True:
+        console.print(Rule("[bold magenta]📐 Análise de Risco & Position Sizing[/bold magenta]"))
+        console.print(
+            "  [bold cyan]1[/bold cyan] Position Sizing — Risco Fixo\n"
+            "  [bold cyan]2[/bold cyan] Position Sizing — Kelly Criterion\n"
+            "  [bold cyan]3[/bold cyan] Position Sizing — ATR-Based\n"
+            "  [bold cyan]4[/bold cyan] Position Sizing — Volatility Targeting\n"
+            "  [bold cyan]5[/bold cyan] Análise de Concentração do Portfolio\n"
+            "  [bold cyan]6[/bold cyan] Simulação Monte Carlo\n"
+            "  [bold cyan]0[/bold cyan] Voltar\n"
+        )
+        op = Prompt.ask("  Opção", default="0").strip()
+
+        if op == "0":
+            break
+
+        elif op in ("1", "2", "3", "4"):
+            console.print(Rule("[dim]Parâmetros[/dim]"))
+
+            if op in ("3", "4"):
+                symbol = Prompt.ask("  Ticker").upper().strip()
+            else:
+                symbol = Prompt.ask("  Ticker (opcional, só para referência)", default="").upper().strip()
+
+            try:
+                # tenta preencher preço actual automaticamente
+                price_default = ""
+                if symbol:
+                    bars = api.get_bars(symbol, tradeapi.TimeFrame.Minute, limit=1).df
+                    if not bars.empty:
+                        price_default = str(round(float(bars.iloc[-1]["close"]), 2))
+            except Exception:
+                price_default = ""
+
+            entry  = float(Prompt.ask("  Preço de entrada ($)", default=price_default or "100"))
+
+            try:
+                acct    = api.get_account()
+                cap_def = str(round(float(acct.equity), 2))
+            except Exception:
+                cap_def = "10000"
+            capital = float(Prompt.ask("  Capital disponível ($)", default=cap_def))
+
+            result = None
+
+            if op == "1":
+                stop      = float(Prompt.ask("  Preço de Stop-Loss ($)"))
+                risk_pct  = float(Prompt.ask("  % do capital a arriscar", default="1.0"))
+                target    = Prompt.ask("  Preço alvo / Take-Profit ($, opcional)", default="")
+                tp        = float(target) if target.strip() else None
+                result    = _model_fixed_risk(capital, risk_pct, entry, stop, tp)
+
+            elif op == "2":
+                stop     = float(Prompt.ask("  Preço de Stop-Loss ($)"))
+                win_rate = float(Prompt.ask("  Win rate histórico (%)", default="50"))
+                avg_win  = float(Prompt.ask("  Ganho médio por trade (%)", default="3.0"))
+                avg_loss = float(Prompt.ask("  Perda média por trade (%)", default="1.5"))
+                result   = _model_kelly(capital, win_rate, avg_win, avg_loss, entry, stop)
+
+            elif op == "3":
+                risk_pct = float(Prompt.ask("  % do capital a arriscar", default="1.0"))
+                atr_mult = float(Prompt.ask("  Multiplicador ATR para stop", default="2.0"))
+                with console.status("[cyan]A calcular ATR…[/cyan]"):
+                    result = _model_atr(api, symbol, capital, risk_pct, entry, atr_mult)
+
+            elif op == "4":
+                vol_tgt = float(Prompt.ask("  Volatilidade anual alvo (%)", default="15"))
+                with console.status("[cyan]A calcular volatilidade histórica…[/cyan]"):
+                    result = _model_vol_target(api, symbol, capital, vol_tgt, entry)
+
+            if result:
+                result.symbol = symbol
+                console.print()
+                _show_size_result(result)
+
+        elif op == "5":
+            _show_portfolio_risk(api)
+
+        elif op == "6":
+            symbol  = Prompt.ask("  Ticker").upper().strip()
+            try:
+                acct    = api.get_account()
+                cap_def = str(round(float(acct.equity), 2))
+            except Exception:
+                cap_def = "10000"
+            capital = float(Prompt.ask("  Capital ($)", default=cap_def))
+            days    = int(Prompt.ask("  Dias a simular", default="252"))
+            sims    = int(Prompt.ask("  Nº de simulações", default="1000"))
+            _monte_carlo(api, symbol, capital, days, sims)
+
+        console.print()
+        input("  ↩  Prima Enter para continuar…")
+
+
+# ══════════════════════════════════════════════════════════════
 #  MENU PRINCIPAL
 # ══════════════════════════════════════════════════════════════
 
 MENU_OPTIONS = {
-    "1":  ("💰 Resumo da Conta",           "account"),
-    "2":  ("📂 Posições Abertas",          "positions"),
-    "3":  ("📡 Watchlist ao Vivo",         "watchlist"),
-    "4":  ("📊 Indicadores Técnicos",      "technical"),
-    "5":  ("🧪 Backtesting",               "backtest"),
-    "6":  ("📋 Ordens Pendentes",          "orders"),
-    "7":  ("➕ Nova Ordem",                "place"),
-    "8":  ("❌ Cancelar Ordem",            "cancel"),
-    "9":  ("📉 Cotação Rápida",            "quote"),
-    "10": ("📜 Histórico de Trades",       "history"),
-    "11": ("🔔 Alertas de Preço",          "alerts"),
-    "12": ("🛡️  Stop-Loss / Take-Profit",  "sltp"),
-    "13": ("🤖 Assistente IA",             "ai"),
-    "0":  ("🚪 Sair",                      "exit"),
+    "1":  ("💰 Resumo da Conta",                "account"),
+    "2":  ("📂 Posições Abertas",               "positions"),
+    "3":  ("📡 Watchlist ao Vivo",              "watchlist"),
+    "4":  ("📊 Indicadores Técnicos",           "technical"),
+    "5":  ("🧪 Backtesting",                    "backtest"),
+    "6":  ("📐 Análise de Risco & Sizing",      "risk"),
+    "7":  ("📋 Ordens Pendentes",               "orders"),
+    "8":  ("➕ Nova Ordem",                     "place"),
+    "9":  ("❌ Cancelar Ordem",                 "cancel"),
+    "10": ("📉 Cotação Rápida",                 "quote"),
+    "11": ("📜 Histórico de Trades",            "history"),
+    "12": ("🔔 Alertas de Preço",               "alerts"),
+    "13": ("🛡️  Stop-Loss / Take-Profit",       "sltp"),
+    "14": ("🤖 Assistente IA",                  "ai"),
+    "0":  ("🚪 Sair",                           "exit"),
 }
 
 def print_menu():
@@ -2283,6 +2736,8 @@ def main():
             technical_analysis(api)
         elif action == "backtest":
             backtesting_menu(api)
+        elif action == "risk":
+            risk_menu(api)
         elif action == "orders":
             show_open_orders(api)
         elif action == "place":
