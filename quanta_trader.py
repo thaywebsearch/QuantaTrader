@@ -2647,6 +2647,566 @@ def risk_menu(api: tradeapi.REST):
 
 
 # ══════════════════════════════════════════════════════════════
+#  MÓDULO: IA E AUTOMAÇÃO (PONTO 7)
+#
+#  7a. Análise de Notícias com IA  — sentiment + impacto
+#  7b. Estratégias Automáticas     — regras em loop (proto-algo)
+#  7c. Relatório Diário Gerado por IA — resumo Claude do dia
+# ══════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────────────────
+#  7a. ANÁLISE DE NOTÍCIAS COM IA
+# ─────────────────────────────────────────────────────────────
+
+NEWS_SOURCES = {
+    "Alpaca News":    "https://data.alpaca.markets/v1beta1/news",
+    "Web (fallback)": None,
+}
+
+def _fetch_alpaca_news(api: tradeapi.REST, symbols: List[str], limit: int = 10) -> List[dict]:
+    """Obtém notícias recentes da Alpaca News API."""
+    try:
+        import requests as req
+        url = "https://data.alpaca.markets/v1beta1/news"
+        headers = {
+            "APCA-API-KEY-ID":     ALPACA_API_KEY,
+            "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+        }
+        params = {"symbols": ",".join(symbols), "limit": limit, "sort": "desc"}
+        r = req.get(url, headers=headers, params=params, timeout=10)
+        if r.status_code == 200:
+            return r.json().get("news", [])
+    except Exception:
+        pass
+    return []
+
+
+def _analyse_news_with_ai(ai_client: anthropic.Anthropic, news_items: List[dict], symbols: List[str]) -> str:
+    """Envia notícias ao Claude para análise de sentimento e impacto."""
+    if not news_items:
+        return "Sem notícias recentes encontradas para os tickers seleccionados."
+
+    headlines = "\n".join(
+        f"- [{n.get('created_at','')[:10]}] {n.get('headline','')}"
+        for n in news_items[:15]
+    )
+
+    prompt = f"""Analisa as seguintes manchetes de notícias financeiras para os tickers: {', '.join(symbols)}.
+
+MANCHETES:
+{headlines}
+
+Para cada ticker mencionado, fornece:
+1. Sentimento geral (Positivo / Neutro / Negativo) com score de -10 a +10
+2. Principais temas identificados
+3. Potencial impacto no preço a curto prazo (1-5 dias)
+4. Nível de confiança da análise (Baixo / Médio / Alto)
+5. Sugestão de acção (Monitorizar / Considerar Compra / Considerar Venda / Evitar)
+
+Sê conciso, objectivo e sempre menciona que é uma análise informativa, não um conselho financeiro."""
+
+    response = ai_client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=1024,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return response.content[0].text
+
+
+def news_analysis_menu(ai_client: Optional[anthropic.Anthropic], api: tradeapi.REST):
+    """Fluxo de análise de notícias com IA."""
+    if not ai_client:
+        console.print("[yellow]⚠️  Assistente IA não disponível. Configura ANTHROPIC_API_KEY no .env[/yellow]")
+        return
+
+    console.print(Rule("[bold yellow]📰 Análise de Notícias com IA[/bold yellow]"))
+
+    # sugerir tickers das posições abertas
+    try:
+        positions = api.list_positions()
+        pos_tickers = [p.symbol for p in positions]
+    except Exception:
+        pos_tickers = []
+
+    default_tickers = ",".join(pos_tickers[:5]) if pos_tickers else "AAPL,TSLA,NVDA"
+    raw = Prompt.ask(f"  Tickers a analisar", default=default_tickers)
+    symbols = [s.strip().upper() for s in raw.split(",") if s.strip()]
+    limit   = int(Prompt.ask("  Nº de notícias a analisar", default="15"))
+
+    with console.status("[cyan]A obter notícias recentes…[/cyan]"):
+        news = _fetch_alpaca_news(api, symbols, limit)
+
+    if news:
+        console.print(f"\n  [dim]Encontradas {len(news)} notícias. A analisar com Claude…[/dim]")
+
+        # mostra manchetes
+        table = Table(box=box.SIMPLE, show_header=True, header_style="bold dim", show_edge=False)
+        table.add_column("Data",      width=12)
+        table.add_column("Ticker(s)", width=12)
+        table.add_column("Manchete",  width=60)
+        for n in news[:10]:
+            syms_str = ", ".join(n.get("symbols", [])[:3])
+            table.add_row(
+                n.get("created_at", "")[:10],
+                syms_str or "—",
+                n.get("headline", "")[:70],
+            )
+        console.print(Panel(table, title="[dim]📋 Manchetes Recentes[/dim]", border_style="dim"))
+    else:
+        console.print("  [yellow]Sem notícias via Alpaca. A analisar com base no conhecimento do modelo…[/yellow]")
+        # fallback: pede análise geral ao Claude sem notícias específicas
+        news = [{"headline": f"Análise geral de {s} pedida pelo utilizador", "created_at": datetime.now().isoformat(), "symbols": [s]} for s in symbols]
+
+    with console.status("[cyan]Claude a analisar sentimento e impacto…[/cyan]"):
+        analysis = _analyse_news_with_ai(ai_client, news, symbols)
+
+    console.print(Panel(
+        analysis,
+        title="[bold yellow]🤖 Análise de Sentimento — Claude[/bold yellow]",
+        border_style="yellow",
+        padding=(1, 2),
+    ))
+    console.print("\n  [dim italic]⚠️  Análise informativa. Não constitui conselho financeiro.[/dim italic]")
+
+
+# ─────────────────────────────────────────────────────────────
+#  7b. ESTRATÉGIAS AUTOMÁTICAS (proto-algo trading)
+# ─────────────────────────────────────────────────────────────
+
+@dataclass
+class AutoRule:
+    """Regra de trading automático."""
+    id:          int
+    name:        str
+    symbol:      str
+    condition:   str        # descrição humana
+    action:      str        # "buy" | "sell"
+    qty:         str
+    order_type:  str        # "market" | "limit"
+    limit_price: Optional[float]
+    # condição técnica
+    indicator:   str        # "rsi_below" | "rsi_above" | "sma_cross_up" | "sma_cross_down" | "price_below" | "price_above"
+    param1:      float      # valor principal (ex: nível RSI, preço)
+    param2:      float = 0  # parâmetro secundário (ex: período SMA lenta)
+    period:      int   = 14 # período do indicador
+    active:      bool  = True
+    last_checked: str = ""
+    last_fired:   str = ""
+    fire_count:   int = 0
+
+
+class AutoTrader:
+    """
+    Motor de estratégias automáticas.
+    Avalia regras a cada `interval` segundos e executa ordens quando
+    as condições são satisfeitas.
+    """
+
+    def __init__(self, api: tradeapi.REST, interval: int = 60):
+        self.api      = api
+        self.interval = interval
+        self.rules:   List[AutoRule] = []
+        self._lock    = threading.Lock()
+        self._stop    = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._next_id = 1
+
+    def add_rule(self, rule: AutoRule):
+        rule.id = self._next_id
+        self._next_id += 1
+        with self._lock:
+            self.rules.append(rule)
+
+    def remove_rule(self, rule_id: int) -> bool:
+        with self._lock:
+            before = len(self.rules)
+            self.rules = [r for r in self.rules if r.id != rule_id]
+            return len(self.rules) < before
+
+    def list_rules(self) -> List[AutoRule]:
+        with self._lock:
+            return list(self.rules)
+
+    def _evaluate_condition(self, rule: AutoRule) -> bool:
+        """Avalia se a condição de uma regra é satisfeita."""
+        try:
+            if not _PANDAS_OK:
+                return False
+
+            bars = _fetch_ohlcv(self.api, rule.symbol, tradeapi.TimeFrame.Day, max(rule.period * 3, 60))
+            if bars is None or bars.empty:
+                return False
+
+            close   = bars["close"]
+            current = float(close.iloc[-1])
+
+            if rule.indicator == "price_above":
+                return current >= rule.param1
+            elif rule.indicator == "price_below":
+                return current <= rule.param1
+            elif rule.indicator == "rsi_above":
+                rsi_val = float(_rsi(close, rule.period).iloc[-1])
+                return rsi_val >= rule.param1
+            elif rule.indicator == "rsi_below":
+                rsi_val = float(_rsi(close, rule.period).iloc[-1])
+                return rsi_val <= rule.param1
+            elif rule.indicator == "sma_cross_up":
+                fast = _sma(close, int(rule.param1))
+                slow = _sma(close, int(rule.param2))
+                return float(fast.iloc[-1]) > float(slow.iloc[-1]) and float(fast.iloc[-2]) <= float(slow.iloc[-2])
+            elif rule.indicator == "sma_cross_down":
+                fast = _sma(close, int(rule.param1))
+                slow = _sma(close, int(rule.param2))
+                return float(fast.iloc[-1]) < float(slow.iloc[-1]) and float(fast.iloc[-2]) >= float(slow.iloc[-2])
+            elif rule.indicator == "macd_cross_up":
+                ml, sl, _ = _macd(close)
+                return float(ml.iloc[-1]) > float(sl.iloc[-1]) and float(ml.iloc[-2]) <= float(sl.iloc[-2])
+            elif rule.indicator == "macd_cross_down":
+                ml, sl, _ = _macd(close)
+                return float(ml.iloc[-1]) < float(sl.iloc[-1]) and float(ml.iloc[-2]) >= float(sl.iloc[-2])
+        except Exception:
+            pass
+        return False
+
+    def _fire_rule(self, rule: AutoRule):
+        """Executa a ordem associada a uma regra."""
+        try:
+            kwargs = dict(
+                symbol=rule.symbol,
+                qty=rule.qty,
+                side=rule.action,
+                type=rule.order_type,
+                time_in_force="day",
+            )
+            if rule.order_type == "limit" and rule.limit_price:
+                kwargs["limit_price"] = str(rule.limit_price)
+
+            order = self.api.submit_order(**kwargs)
+            rule.last_fired = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            rule.fire_count += 1
+
+            icon = "🟢" if rule.action == "buy" else "🔴"
+            console.print(
+                f"\n  {icon} [bold]AUTOTRADER DISPAROU:[/bold]  "
+                f"[bold]{rule.name}[/bold]  →  "
+                f"{'[green]' if rule.action == 'buy' else '[red]'}{rule.action.upper()}[/]  "
+                f"{rule.qty}× [bold]{rule.symbol}[/bold]  "
+                f"[dim](Order {order.id[:8]}…)[/dim]"
+            )
+            # desactiva após execução (evita duplicados)
+            rule.active = False
+
+        except Exception as e:
+            console.print(f"  [red]❌ AutoTrader erro em '{rule.name}': {e}[/red]")
+
+    def _check_rules(self):
+        with self._lock:
+            active_rules = [r for r in self.rules if r.active]
+
+        for rule in active_rules:
+            rule.last_checked = datetime.now().strftime("%H:%M:%S")
+            if self._evaluate_condition(rule):
+                self._fire_rule(rule)
+
+    def _run(self):
+        while not self._stop.is_set():
+            self._check_rules()
+            self._stop.wait(self.interval)
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="AutoTrader")
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+
+
+INDICATOR_OPTIONS = {
+    "1": ("RSI abaixo de nível",    "rsi_below"),
+    "2": ("RSI acima de nível",     "rsi_above"),
+    "3": ("Preço abaixo de valor",  "price_below"),
+    "4": ("Preço acima de valor",   "price_above"),
+    "5": ("SMA cruzamento acima",   "sma_cross_up"),
+    "6": ("SMA cruzamento abaixo",  "sma_cross_down"),
+    "7": ("MACD cruzamento acima",  "macd_cross_up"),
+    "8": ("MACD cruzamento abaixo", "macd_cross_down"),
+}
+
+
+def auto_trader_menu(auto_trader: AutoTrader):
+    """Submenu de gestão de estratégias automáticas."""
+    while True:
+        console.print(Rule("[bold green]🤖 Estratégias Automáticas[/bold green]"))
+        rules = auto_trader.list_rules()
+        activas = sum(1 for r in rules if r.active)
+        console.print(f"  [dim]{activas} regras activas de {len(rules)} total[/dim]\n")
+        console.print(
+            "  [bold cyan]1[/bold cyan] Ver regras\n"
+            "  [bold cyan]2[/bold cyan] Criar nova regra\n"
+            "  [bold cyan]3[/bold cyan] Activar / Desactivar regra\n"
+            "  [bold cyan]4[/bold cyan] Remover regra\n"
+            "  [bold cyan]0[/bold cyan] Voltar\n"
+        )
+        op = Prompt.ask("  Opção", default="0").strip()
+
+        if op == "0":
+            break
+
+        elif op == "1":
+            if not rules:
+                console.print("[yellow]Sem regras configuradas.[/yellow]")
+            else:
+                table = Table(box=box.ROUNDED, border_style="green", header_style="bold green")
+                table.add_column("ID",       width=4,  justify="center")
+                table.add_column("Nome",     width=18)
+                table.add_column("Ticker",   width=8)
+                table.add_column("Condição", width=28)
+                table.add_column("Acção",    width=10, justify="center")
+                table.add_column("Qty",      width=6,  justify="right")
+                table.add_column("Estado",   width=12)
+                table.add_column("Disparos", width=9,  justify="right")
+                table.add_column("Último",   width=14)
+
+                for r in rules:
+                    state = "[cyan]⚡ Activa[/cyan]" if r.active else "[dim]⏸ Inactiva[/dim]"
+                    act_c = "green" if r.action == "buy" else "red"
+                    table.add_row(
+                        str(r.id), r.name, r.symbol,
+                        r.condition,
+                        f"[{act_c}]{r.action.upper()}[/{act_c}]",
+                        r.qty, state,
+                        str(r.fire_count),
+                        r.last_fired or "—",
+                    )
+                console.print(Panel(table, title="[bold green]🤖 Regras AutoTrader[/bold green]", border_style="green"))
+
+        elif op == "2":
+            console.print(Rule("[dim]Nova Regra[/dim]"))
+            name   = Prompt.ask("  Nome da regra")
+            symbol = Prompt.ask("  Ticker").upper().strip()
+            action = Prompt.ask("  Acção", choices=["buy", "sell"], default="buy")
+            qty    = Prompt.ask("  Quantidade", default="1")
+            otype  = Prompt.ask("  Tipo de ordem", choices=["market", "limit"], default="market")
+            lp     = float(Prompt.ask("  Limit price ($)")) if otype == "limit" else None
+
+            console.print("\n  Condição de disparo:")
+            for k, (label, _) in INDICATOR_OPTIONS.items():
+                console.print(f"    [bold cyan]{k}[/bold cyan]  {label}")
+
+            ind_choice = Prompt.ask("  Indicador", choices=list(INDICATOR_OPTIONS.keys()), default="1")
+            _, ind_key = INDICATOR_OPTIONS[ind_choice]
+
+            p1 = p2 = 0.0
+            period = 14
+            cond_desc = ""
+
+            if ind_key in ("rsi_below", "rsi_above"):
+                period = int(Prompt.ask("  Período RSI", default="14"))
+                p1     = float(Prompt.ask("  Nível RSI", default="30" if "below" in ind_key else "70"))
+                sign   = "≤" if "below" in ind_key else "≥"
+                cond_desc = f"RSI({period}) {sign} {p1}"
+            elif ind_key in ("price_below", "price_above"):
+                p1    = float(Prompt.ask("  Preço ($)"))
+                sign  = "≤" if "below" in ind_key else "≥"
+                cond_desc = f"Preço {sign} ${p1:,.2f}"
+            elif "sma" in ind_key:
+                p1 = float(Prompt.ask("  SMA rápida (períodos)", default="20"))
+                p2 = float(Prompt.ask("  SMA lenta  (períodos)", default="50"))
+                cond_desc = f"SMA{int(p1)} cruzou {'acima' if 'up' in ind_key else 'abaixo'} de SMA{int(p2)}"
+            elif "macd" in ind_key:
+                cond_desc = f"MACD cruzou {'acima' if 'up' in ind_key else 'abaixo'} da Signal"
+
+            rule = AutoRule(
+                id=0, name=name, symbol=symbol,
+                condition=cond_desc, action=action, qty=qty,
+                order_type=otype, limit_price=lp,
+                indicator=ind_key, param1=p1, param2=p2, period=period,
+            )
+
+            console.print(Panel(
+                f"  [bold]{name}[/bold]\n"
+                f"  SE [cyan]{cond_desc}[/cyan]\n"
+                f"  ENTÃO {'[green]' if action == 'buy' else '[red]'}{action.upper()}[/]  {qty}× {symbol}  ({otype})",
+                title="Confirmar Regra", border_style="green"
+            ))
+
+            if Confirm.ask("  Activar esta regra?"):
+                auto_trader.add_rule(rule)
+                console.print(f"[green]✅ Regra '{name}' criada e activa![/green]")
+
+        elif op == "3":
+            if not rules:
+                console.print("[yellow]Sem regras.[/yellow]")
+            else:
+                rid = int(Prompt.ask("  ID da regra"))
+                with auto_trader._lock:
+                    r = next((x for x in auto_trader.rules if x.id == rid), None)
+                if r:
+                    r.active = not r.active
+                    state = "activada" if r.active else "desactivada"
+                    console.print(f"[green]✅ Regra #{rid} {state}.[/green]")
+                else:
+                    console.print("[yellow]Regra não encontrada.[/yellow]")
+
+        elif op == "4":
+            if not rules:
+                console.print("[yellow]Sem regras.[/yellow]")
+            else:
+                rid = int(Prompt.ask("  ID da regra a remover"))
+                if auto_trader.remove_rule(rid):
+                    console.print(f"[green]✅ Regra #{rid} removida.[/green]")
+                else:
+                    console.print("[yellow]Regra não encontrada.[/yellow]")
+
+        console.print()
+        input("  ↩  Prima Enter para continuar…")
+
+
+# ─────────────────────────────────────────────────────────────
+#  7c. RELATÓRIO DIÁRIO GERADO POR IA
+# ─────────────────────────────────────────────────────────────
+
+def _build_daily_context(api: tradeapi.REST) -> str:
+    """Recolhe dados do portfolio para o relatório diário."""
+    lines = [f"DATA: {datetime.now().strftime('%Y-%m-%d %H:%M')}"]
+
+    try:
+        acct = api.get_account()
+        lines += [
+            f"\n== CONTA ==",
+            f"Equity: ${float(acct.equity):,.2f}",
+            f"Cash:   ${float(acct.cash):,.2f}",
+            f"P&L não realizado: ${float(getattr(acct, 'unrealized_pl', 0)):,.2f}",
+        ]
+    except Exception:
+        pass
+
+    try:
+        positions = api.list_positions()
+        if positions:
+            lines.append("\n== POSIÇÕES ABERTAS ==")
+            for p in positions:
+                pl_pct = float(p.unrealized_plpc) * 100
+                lines.append(
+                    f"{p.symbol}: {p.qty} shares @ ${float(p.current_price):,.2f}  "
+                    f"P&L: {pl_pct:+.2f}%  (${float(p.unrealized_pl):+,.2f})"
+                )
+    except Exception:
+        pass
+
+    try:
+        orders = api.list_orders(status="closed", limit=10, direction="desc")
+        if orders:
+            lines.append("\n== ÚLTIMOS TRADES HOJE ==")
+            today = datetime.now().strftime("%Y-%m-%d")
+            for o in orders:
+                if o.submitted_at and o.submitted_at[:10] == today:
+                    price = f"${float(o.filled_avg_price):,.2f}" if o.filled_avg_price else "—"
+                    lines.append(f"{o.side.upper()} {o.qty}× {o.symbol} @ {price}  [{o.status}]")
+    except Exception:
+        pass
+
+    return "\n".join(lines)
+
+
+def daily_report(ai_client: Optional[anthropic.Anthropic], api: tradeapi.REST):
+    """Gera relatório diário com Claude."""
+    if not ai_client:
+        console.print("[yellow]⚠️  Assistente IA não disponível. Configura ANTHROPIC_API_KEY no .env[/yellow]")
+        return
+
+    console.print(Rule("[bold cyan]📋 Relatório Diário — IA[/bold cyan]"))
+
+    include_outlook = Confirm.ask("  Incluir outlook de mercado amanhã?", default=True)
+    include_suggest = Confirm.ask("  Incluir sugestões de acção?", default=True)
+
+    with console.status("[cyan]A recolher dados do portfolio…[/cyan]"):
+        context = _build_daily_context(api)
+
+    prompt = f"""Com base nos dados abaixo do portfolio de trading, gera um relatório diário profissional em Português de Portugal.
+
+{context}
+
+O relatório deve incluir:
+1. **Resumo executivo** (2-3 frases)
+2. **Performance do dia** — análise das posições e P&L
+3. **Destaques** — melhor e pior posição, se aplicável
+{"4. **Outlook para amanhã** — factores de mercado a monitorizar" if include_outlook else ""}
+{"5. **Sugestões de acção** — posições a considerar ajustar (com raciocínio)" if include_suggest else ""}
+{"6." if include_outlook or include_suggest else "4."} **Riscos a vigiar**
+
+Usa linguagem directa e profissional. Sê específico com números.
+Termina sempre com um disclaimer de que não constitui conselho financeiro."""
+
+    with console.status("[cyan]Claude a gerar relatório…[/cyan]"):
+        response = ai_client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1500,
+            messages=[{"role": "user", "content": prompt}],
+        )
+    report = response.content[0].text
+
+    console.print(Panel(
+        report,
+        title=f"[bold cyan]📋 Relatório Diário  {datetime.now().strftime('%Y-%m-%d')}[/bold cyan]",
+        border_style="cyan",
+        padding=(1, 2),
+    ))
+
+    if Confirm.ask("\n  Guardar relatório em ficheiro?", default=False):
+        fname = f"relatorio_{datetime.now().strftime('%Y%m%d_%H%M')}.txt"
+        try:
+            with open(fname, "w", encoding="utf-8") as f:
+                f.write(f"QuantaTrader — Relatório Diário\n{'='*40}\n\n")
+                f.write(report)
+            console.print(f"[green]✅ Guardado em [bold]{fname}[/bold][/green]")
+        except Exception as e:
+            console.print(f"[red]Erro ao guardar: {e}[/red]")
+
+
+# ── menu IA & Automação ───────────────────────────────────────
+
+def ia_automation_menu(
+    ai_client:    Optional[anthropic.Anthropic],
+    api:          tradeapi.REST,
+    auto_trader:  "AutoTrader",
+):
+    """Menu principal de IA e Automação."""
+    while True:
+        console.print(Rule("[bold cyan]🤖 IA & Automação[/bold cyan]"))
+        rules    = auto_trader.list_rules()
+        activas  = sum(1 for r in rules if r.active)
+        console.print(
+            f"  [bold cyan]1[/bold cyan] 📰 Análise de Notícias com IA\n"
+            f"  [bold cyan]2[/bold cyan] ⚙️  Estratégias Automáticas  [dim]({activas} activas)[/dim]\n"
+            f"  [bold cyan]3[/bold cyan] 📋 Relatório Diário IA\n"
+            f"  [bold cyan]4[/bold cyan] 💬 Assistente IA (chat livre)\n"
+            f"  [bold cyan]0[/bold cyan] Voltar\n"
+        )
+        op = Prompt.ask("  Opção", default="0").strip()
+
+        if op == "0":
+            break
+        elif op == "1":
+            news_analysis_menu(ai_client, api)
+        elif op == "2":
+            auto_trader_menu(auto_trader)
+        elif op == "3":
+            daily_report(ai_client, api)
+        elif op == "4":
+            if ai_client:
+                ai_assistant(ai_client, api)
+            else:
+                console.print("[yellow]Assistente IA não disponível. Configura ANTHROPIC_API_KEY no .env[/yellow]")
+
+        console.print()
+        input("  ↩  Prima Enter para continuar…")
+
+
+# ══════════════════════════════════════════════════════════════
 #  MENU PRINCIPAL
 # ══════════════════════════════════════════════════════════════
 
@@ -2657,14 +3217,14 @@ MENU_OPTIONS = {
     "4":  ("📊 Indicadores Técnicos",           "technical"),
     "5":  ("🧪 Backtesting",                    "backtest"),
     "6":  ("📐 Análise de Risco & Sizing",      "risk"),
-    "7":  ("📋 Ordens Pendentes",               "orders"),
-    "8":  ("➕ Nova Ordem",                     "place"),
-    "9":  ("❌ Cancelar Ordem",                 "cancel"),
-    "10": ("📉 Cotação Rápida",                 "quote"),
-    "11": ("📜 Histórico de Trades",            "history"),
-    "12": ("🔔 Alertas de Preço",               "alerts"),
-    "13": ("🛡️  Stop-Loss / Take-Profit",       "sltp"),
-    "14": ("🤖 Assistente IA",                  "ai"),
+    "7":  ("🤖 IA & Automação",                 "ia_auto"),
+    "8":  ("📋 Ordens Pendentes",               "orders"),
+    "9":  ("➕ Nova Ordem",                     "place"),
+    "10": ("❌ Cancelar Ordem",                 "cancel"),
+    "11": ("📉 Cotação Rápida",                 "quote"),
+    "12": ("📜 Histórico de Trades",            "history"),
+    "13": ("🔔 Alertas de Preço",               "alerts"),
+    "14": ("🛡️  Stop-Loss / Take-Profit",       "sltp"),
     "0":  ("🚪 Sair",                           "exit"),
 }
 
@@ -2707,6 +3267,11 @@ def main():
     watchlist = Watchlist(api, DEFAULT_WATCHLIST, interval=20)
     watchlist.start()
     console.print("[green]✅ Watchlist activa[/green]  [dim](intervalo: 20s · 10 tickers)[/dim]")
+
+    # Iniciar AutoTrader em background (avalia regras a cada 60s)
+    auto_trader = AutoTrader(api, interval=60)
+    auto_trader.start()
+    console.print("[green]✅ AutoTrader activo[/green]  [dim](intervalo: 60s)[/dim]")
     console.print()
 
     while True:
@@ -2724,6 +3289,7 @@ def main():
             alert_manager.stop()
             sltp_manager.stop()
             watchlist.stop()
+            auto_trader.stop()
             console.print("[dim]Até logo! 👋[/dim]")
             break
         elif action == "account":
@@ -2738,6 +3304,8 @@ def main():
             backtesting_menu(api)
         elif action == "risk":
             risk_menu(api)
+        elif action == "ia_auto":
+            ia_automation_menu(ai_client, api, auto_trader)
         elif action == "orders":
             show_open_orders(api)
         elif action == "place":
@@ -2752,11 +3320,6 @@ def main():
             alerts_menu(alert_manager)
         elif action == "sltp":
             sltp_menu(sltp_manager, api)
-        elif action == "ai":
-            if ai_client:
-                ai_assistant(ai_client, api)
-            else:
-                console.print("[yellow]Assistente IA não disponível. Configura ANTHROPIC_API_KEY no .env[/yellow]")
 
         console.print()
         input("  ↩  Prima Enter para continuar…")
