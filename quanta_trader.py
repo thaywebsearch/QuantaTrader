@@ -3207,6 +3207,631 @@ def ia_automation_menu(
 
 
 # ══════════════════════════════════════════════════════════════
+#  MÓDULO: BASE DE DADOS LOCAL (SQLite)
+#
+#  Tabelas:
+#    • trades         — histórico de trades executados
+#    • alerts_log     — log de alertas disparados
+#    • sltp_log       — log de SL/TP executados
+#    • daily_snapshots— snapshot diário do portfolio
+#    • notes          — notas livres associadas a tickers
+#    • backtest_runs  — resultados de backtests guardados
+#
+#  Funcionalidades:
+#    • Importação automática do histórico Alpaca
+#    • Exportação para CSV
+#    • Dashboard de estatísticas pessoais
+#    • Pesquisa por ticker / período
+# ══════════════════════════════════════════════════════════════
+
+import sqlite3
+from contextlib import contextmanager
+
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "quanta_trader.db")
+
+
+# ── schema ────────────────────────────────────────────────────
+
+SCHEMA = """
+PRAGMA journal_mode=WAL;
+PRAGMA foreign_keys=ON;
+
+CREATE TABLE IF NOT EXISTS trades (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    alpaca_id     TEXT UNIQUE,
+    symbol        TEXT NOT NULL,
+    side          TEXT NOT NULL,          -- buy | sell
+    qty           REAL NOT NULL,
+    filled_price  REAL,
+    filled_at     TEXT,
+    order_type    TEXT,
+    status        TEXT,
+    pnl           REAL DEFAULT 0,
+    notes         TEXT DEFAULT '',
+    created_at    TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS alerts_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol      TEXT NOT NULL,
+    condition   TEXT NOT NULL,            -- above | below
+    target      REAL NOT NULL,
+    fired_price REAL,
+    fired_at    TEXT DEFAULT (datetime('now')),
+    note        TEXT DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS sltp_log (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol        TEXT NOT NULL,
+    type          TEXT NOT NULL,          -- sl_hit | tp_hit
+    entry_price   REAL,
+    close_price   REAL,
+    qty           REAL,
+    pnl           REAL,
+    pnl_pct       REAL,
+    executed_at   TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS daily_snapshots (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    date       TEXT NOT NULL UNIQUE,
+    equity     REAL NOT NULL,
+    cash       REAL NOT NULL,
+    pl_day     REAL DEFAULT 0,
+    n_positions INTEGER DEFAULT 0,
+    snapshot   TEXT DEFAULT ''           -- JSON das posições
+);
+
+CREATE TABLE IF NOT EXISTS notes (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol     TEXT NOT NULL,
+    body       TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS backtest_runs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    strategy    TEXT NOT NULL,
+    symbol      TEXT NOT NULL,
+    timeframe   TEXT NOT NULL,
+    params      TEXT NOT NULL,           -- JSON
+    total_ret   REAL,
+    bh_ret      REAL,
+    sharpe      REAL,
+    max_dd      REAL,
+    win_rate    REAL,
+    n_trades    INTEGER,
+    created_at  TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_trades_symbol   ON trades(symbol);
+CREATE INDEX IF NOT EXISTS idx_trades_filled   ON trades(filled_at);
+CREATE INDEX IF NOT EXISTS idx_notes_symbol    ON notes(symbol);
+CREATE INDEX IF NOT EXISTS idx_snapshots_date  ON daily_snapshots(date);
+"""
+
+
+# ── QuantaDB — classe principal ───────────────────────────────
+
+class QuantaDB:
+    """Interface SQLite para o QuantaTrader."""
+
+    def __init__(self, path: str = DB_PATH):
+        self.path = path
+        self._init_db()
+
+    @contextmanager
+    def _conn(self):
+        con = sqlite3.connect(self.path, timeout=10)
+        con.row_factory = sqlite3.Row
+        try:
+            yield con
+            con.commit()
+        except Exception:
+            con.rollback()
+            raise
+        finally:
+            con.close()
+
+    def _init_db(self):
+        with self._conn() as con:
+            con.executescript(SCHEMA)
+
+    # ── trades ────────────────────────────────────────────────
+
+    def upsert_trade(self, alpaca_id: str, symbol: str, side: str,
+                     qty: float, filled_price: Optional[float],
+                     filled_at: Optional[str], order_type: str,
+                     status: str, notes: str = ""):
+        with self._conn() as con:
+            con.execute("""
+                INSERT INTO trades (alpaca_id, symbol, side, qty, filled_price,
+                                    filled_at, order_type, status, notes)
+                VALUES (?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(alpaca_id) DO UPDATE SET
+                    filled_price = excluded.filled_price,
+                    status       = excluded.status,
+                    filled_at    = excluded.filled_at
+            """, (alpaca_id, symbol, side, qty, filled_price, filled_at,
+                  order_type, status, notes))
+
+    def get_trades(self, symbol: str = "", limit: int = 50,
+                   since: str = "") -> list:
+        with self._conn() as con:
+            q   = "SELECT * FROM trades WHERE 1=1"
+            par: list = []
+            if symbol:
+                q += " AND symbol = ?"
+                par.append(symbol.upper())
+            if since:
+                q += " AND filled_at >= ?"
+                par.append(since)
+            q += " ORDER BY filled_at DESC LIMIT ?"
+            par.append(limit)
+            return [dict(r) for r in con.execute(q, par).fetchall()]
+
+    def update_trade_pnl(self, alpaca_id: str, pnl: float):
+        with self._conn() as con:
+            con.execute("UPDATE trades SET pnl=? WHERE alpaca_id=?",
+                        (pnl, alpaca_id))
+
+    # ── alerts log ────────────────────────────────────────────
+
+    def log_alert(self, symbol: str, condition: str, target: float,
+                  fired_price: float, note: str = ""):
+        with self._conn() as con:
+            con.execute("""
+                INSERT INTO alerts_log (symbol, condition, target, fired_price, note)
+                VALUES (?,?,?,?,?)
+            """, (symbol, condition, target, fired_price, note))
+
+    # ── SL/TP log ─────────────────────────────────────────────
+
+    def log_sltp(self, symbol: str, type_: str, entry: float,
+                 close: float, qty: float):
+        pnl     = (close - entry) * qty if type_ == "tp_hit" else (entry - close) * qty
+        pnl_pct = (close - entry) / entry * 100
+        with self._conn() as con:
+            con.execute("""
+                INSERT INTO sltp_log (symbol, type, entry_price, close_price,
+                                      qty, pnl, pnl_pct)
+                VALUES (?,?,?,?,?,?,?)
+            """, (symbol, type_, entry, close, qty, pnl, pnl_pct))
+
+    # ── snapshots diários ─────────────────────────────────────
+
+    def save_snapshot(self, date: str, equity: float, cash: float,
+                      pl_day: float, n_pos: int, snapshot_json: str = ""):
+        with self._conn() as con:
+            con.execute("""
+                INSERT INTO daily_snapshots
+                    (date, equity, cash, pl_day, n_positions, snapshot)
+                VALUES (?,?,?,?,?,?)
+                ON CONFLICT(date) DO UPDATE SET
+                    equity=excluded.equity, cash=excluded.cash,
+                    pl_day=excluded.pl_day, n_positions=excluded.n_positions,
+                    snapshot=excluded.snapshot
+            """, (date, equity, cash, pl_day, n_pos, snapshot_json))
+
+    def get_snapshots(self, days: int = 30) -> list:
+        with self._conn() as con:
+            return [dict(r) for r in con.execute("""
+                SELECT * FROM daily_snapshots
+                ORDER BY date DESC LIMIT ?
+            """, (days,)).fetchall()]
+
+    # ── notas ─────────────────────────────────────────────────
+
+    def add_note(self, symbol: str, body: str) -> int:
+        with self._conn() as con:
+            cur = con.execute(
+                "INSERT INTO notes (symbol, body) VALUES (?,?)",
+                (symbol.upper(), body)
+            )
+            return cur.lastrowid or 0
+
+    def get_notes(self, symbol: str = "") -> list:
+        with self._conn() as con:
+            if symbol:
+                rows = con.execute(
+                    "SELECT * FROM notes WHERE symbol=? ORDER BY created_at DESC",
+                    (symbol.upper(),)
+                ).fetchall()
+            else:
+                rows = con.execute(
+                    "SELECT * FROM notes ORDER BY created_at DESC LIMIT 50"
+                ).fetchall()
+            return [dict(r) for r in rows]
+
+    def delete_note(self, note_id: int):
+        with self._conn() as con:
+            con.execute("DELETE FROM notes WHERE id=?", (note_id,))
+
+    # ── backtests ─────────────────────────────────────────────
+
+    def save_backtest(self, result: BacktestResult, params: dict):
+        with self._conn() as con:
+            con.execute("""
+                INSERT INTO backtest_runs
+                    (strategy, symbol, timeframe, params,
+                     total_ret, bh_ret, sharpe, max_dd, win_rate, n_trades)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
+            """, (
+                result.strategy, result.symbol, result.timeframe,
+                json.dumps(params),
+                result.total_return, result.bh_return, result.sharpe,
+                result.max_drawdown, result.win_rate, result.n_trades,
+            ))
+
+    def get_backtests(self, limit: int = 20) -> list:
+        with self._conn() as con:
+            return [dict(r) for r in con.execute("""
+                SELECT * FROM backtest_runs ORDER BY created_at DESC LIMIT ?
+            """, (limit,)).fetchall()]
+
+    # ── estatísticas pessoais ─────────────────────────────────
+
+    def get_stats(self) -> dict:
+        with self._conn() as con:
+            total_trades = con.execute(
+                "SELECT COUNT(*) FROM trades WHERE status='filled'"
+            ).fetchone()[0]
+            total_pnl = con.execute(
+                "SELECT COALESCE(SUM(pnl),0) FROM trades WHERE status='filled'"
+            ).fetchone()[0]
+            best = con.execute(
+                "SELECT symbol, pnl FROM trades WHERE status='filled' ORDER BY pnl DESC LIMIT 1"
+            ).fetchone()
+            worst = con.execute(
+                "SELECT symbol, pnl FROM trades WHERE status='filled' ORDER BY pnl ASC LIMIT 1"
+            ).fetchone()
+            top_syms = con.execute("""
+                SELECT symbol, COUNT(*) as n, SUM(pnl) as total_pnl
+                FROM trades WHERE status='filled'
+                GROUP BY symbol ORDER BY n DESC LIMIT 5
+            """).fetchall()
+            win_count = con.execute(
+                "SELECT COUNT(*) FROM trades WHERE status='filled' AND pnl > 0"
+            ).fetchone()[0]
+            n_alerts = con.execute("SELECT COUNT(*) FROM alerts_log").fetchone()[0]
+            n_snaps  = con.execute("SELECT COUNT(*) FROM daily_snapshots").fetchone()[0]
+
+        return {
+            "total_trades": total_trades,
+            "total_pnl":    total_pnl,
+            "win_count":    win_count,
+            "win_rate":     win_count / total_trades * 100 if total_trades else 0,
+            "best":         dict(best) if best else {},
+            "worst":        dict(worst) if worst else {},
+            "top_symbols":  [dict(r) for r in top_syms],
+            "n_alerts":     n_alerts,
+            "n_snapshots":  n_snaps,
+        }
+
+    # ── exportação CSV ────────────────────────────────────────
+
+    def export_csv(self, table: str, path: str):
+        import csv
+        with self._conn() as con:
+            rows = con.execute(f"SELECT * FROM {table}").fetchall()
+            if not rows:
+                return 0
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+                writer.writeheader()
+                writer.writerows([dict(r) for r in rows])
+            return len(rows)
+
+    # ── importação Alpaca ─────────────────────────────────────
+
+    def sync_from_alpaca(self, api: tradeapi.REST, limit: int = 200) -> int:
+        """Importa histórico de ordens da Alpaca para a DB local."""
+        try:
+            orders = api.list_orders(status="closed", limit=limit, direction="desc")
+        except Exception as e:
+            console.print(f"[red]Erro ao obter ordens Alpaca: {e}[/red]")
+            return 0
+
+        imported = 0
+        for o in orders:
+            try:
+                fp = float(o.filled_avg_price) if o.filled_avg_price else None
+                self.upsert_trade(
+                    alpaca_id   = o.id,
+                    symbol      = o.symbol,
+                    side        = o.side,
+                    qty         = float(o.qty or 0),
+                    filled_price= fp,
+                    filled_at   = str(o.filled_at)[:19] if o.filled_at else None,
+                    order_type  = o.type,
+                    status      = o.status,
+                )
+                imported += 1
+            except Exception:
+                continue
+        return imported
+
+
+# ── singleton global ──────────────────────────────────────────
+
+_db: Optional[QuantaDB] = None
+
+def get_db() -> QuantaDB:
+    global _db
+    if _db is None:
+        _db = QuantaDB()
+    return _db
+
+
+# ── UI da base de dados ───────────────────────────────────────
+
+def _show_db_trades(db: QuantaDB):
+    symbol = Prompt.ask("  Filtrar por ticker (vazio = todos)", default="").upper().strip()
+    since  = Prompt.ask("  Desde data (YYYY-MM-DD, vazio = tudo)", default="").strip()
+    limit  = int(Prompt.ask("  Máximo de registos", default="30"))
+
+    trades = db.get_trades(symbol=symbol, limit=limit, since=since)
+    if not trades:
+        console.print("[yellow]Sem trades na base de dados.[/yellow]")
+        return
+
+    table = Table(box=box.ROUNDED, border_style="cyan", header_style="bold cyan")
+    table.add_column("ID",      width=5,  justify="right")
+    table.add_column("Data",    width=12)
+    table.add_column("Ticker",  width=8)
+    table.add_column("Lado",    width=6)
+    table.add_column("Qtd",     width=8,  justify="right")
+    table.add_column("Preço",   width=10, justify="right")
+    table.add_column("P&L",     width=12, justify="right")
+    table.add_column("Estado",  width=10)
+
+    for t in trades:
+        lado  = "[green]BUY[/green]" if t["side"] == "buy" else "[red]SELL[/red]"
+        pnl   = t.get("pnl") or 0
+        pc    = "green" if pnl >= 0 else "red"
+        price = f"${t['filled_price']:,.2f}" if t["filled_price"] else "—"
+        date  = str(t["filled_at"] or t["created_at"])[:10]
+        table.add_row(
+            str(t["id"]), date, t["symbol"], lado,
+            str(t["qty"]), price,
+            f"[{pc}]{pnl:+,.2f}[/{pc}]" if pnl else "[dim]—[/dim]",
+            t["status"],
+        )
+
+    console.print(Panel(
+        table,
+        title=f"[bold cyan]📦 Trades na DB[/bold cyan]  [dim]({len(trades)} registos)[/dim]",
+        border_style="cyan",
+    ))
+
+
+def _show_db_stats(db: QuantaDB):
+    s = db.get_stats()
+    pnl_c = "green" if s["total_pnl"] >= 0 else "red"
+    wr_c  = "green" if s["win_rate"] >= 50 else "yellow" if s["win_rate"] >= 40 else "red"
+
+    lines = [
+        f"  [bold]Total de Trades:[/bold]     {s['total_trades']}",
+        f"  [bold]P&L Total:[/bold]           [{pnl_c}]{s['total_pnl']:+,.2f}[/{pnl_c}]",
+        f"  [bold]Win Rate:[/bold]            [{wr_c}]{s['win_rate']:.1f}%[/{wr_c}]  ({s['win_count']} ganhos)",
+        f"  [bold]Alertas Disparados:[/bold]  {s['n_alerts']}",
+        f"  [bold]Snapshots Diários:[/bold]   {s['n_snapshots']}",
+    ]
+    if s.get("best") and s["best"].get("symbol"):
+        lines.append(f"\n  [bold]Melhor Trade:[/bold]  [green]{s['best']['symbol']}  +${s['best']['pnl']:,.2f}[/green]")
+    if s.get("worst") and s["worst"].get("symbol"):
+        lines.append(f"  [bold]Pior Trade:[/bold]    [red]{s['worst']['symbol']}  ${s['worst']['pnl']:,.2f}[/red]")
+
+    if s["top_symbols"]:
+        lines.append("\n  [bold]Top Tickers:[/bold]")
+        for sym in s["top_symbols"]:
+            c = "green" if sym["total_pnl"] >= 0 else "red"
+            lines.append(
+                f"    {sym['symbol']:6s}  {sym['n']} trades  "
+                f"[{c}]P&L: {sym['total_pnl']:+,.2f}[/{c}]"
+            )
+
+    console.print(Panel(
+        "\n".join(lines),
+        title="[bold cyan]📊 Estatísticas Pessoais[/bold cyan]",
+        border_style="cyan",
+    ))
+
+
+def _show_db_equity(db: QuantaDB):
+    snaps = db.get_snapshots(days=30)
+    if not snaps:
+        console.print("[yellow]Sem snapshots diários. Guarda um snapshot hoje primeiro.[/yellow]")
+        return
+
+    snaps = list(reversed(snaps))  # ordem cronológica
+    max_eq = max(s["equity"] for s in snaps)
+    min_eq = min(s["equity"] for s in snaps)
+    span   = max_eq - min_eq if max_eq != min_eq else 1
+    height = 8
+    chars  = "▁▂▃▄▅▆▇█"
+
+    lines = []
+    bar_row = ""
+    for s in snaps:
+        idx     = int((s["equity"] - min_eq) / span * 7)
+        pl_c    = "green" if s["pl_day"] >= 0 else "red"
+        bar_row += f"[{pl_c}]{chars[idx]}[/{pl_c}]"
+
+    lines.append(f"  Equity máx: [green]${max_eq:,.2f}[/green]")
+    lines.append(f"  Equity mín: [red]${min_eq:,.2f}[/red]")
+    lines.append(f"  Período:    {snaps[0]['date']} → {snaps[-1]['date']}")
+    lines.append(f"\n  {bar_row}")
+    lines.append(f"\n  [dim]Cada barra = 1 dia  ·  {len(snaps)} snapshots[/dim]")
+
+    console.print(Panel(
+        "\n".join(lines),
+        title="[bold cyan]📈 Evolução de Equity (30 dias)[/bold cyan]",
+        border_style="cyan",
+    ))
+
+
+def _notes_ui(db: QuantaDB):
+    while True:
+        console.print(Rule("[dim]📝 Notas[/dim]"))
+        console.print(
+            "  [bold cyan]1[/bold cyan] Ver notas\n"
+            "  [bold cyan]2[/bold cyan] Adicionar nota\n"
+            "  [bold cyan]3[/bold cyan] Apagar nota\n"
+            "  [bold cyan]0[/bold cyan] Voltar\n"
+        )
+        op = Prompt.ask("  Opção", default="0").strip()
+        if op == "0":
+            break
+        elif op == "1":
+            sym   = Prompt.ask("  Ticker (vazio = todas)", default="").strip()
+            notes = db.get_notes(symbol=sym)
+            if not notes:
+                console.print("[yellow]Sem notas.[/yellow]")
+            else:
+                table = Table(box=box.SIMPLE_HEAD, header_style="bold dim")
+                table.add_column("ID",     width=5, justify="right")
+                table.add_column("Ticker", width=8)
+                table.add_column("Nota",   width=50)
+                table.add_column("Data",   width=12)
+                for n in notes:
+                    table.add_row(str(n["id"]), n["symbol"], n["body"], n["created_at"][:10])
+                console.print(table)
+        elif op == "2":
+            sym  = Prompt.ask("  Ticker").upper().strip()
+            body = Prompt.ask("  Nota")
+            nid  = db.add_note(sym, body)
+            console.print(f"[green]✅ Nota #{nid} guardada.[/green]")
+        elif op == "3":
+            nid = Prompt.ask("  ID da nota a apagar").strip()
+            try:
+                db.delete_note(int(nid))
+                console.print(f"[green]✅ Nota #{nid} apagada.[/green]")
+            except ValueError:
+                console.print("[red]ID inválido.[/red]")
+        console.print()
+        input("  ↩  Prima Enter para continuar…")
+
+
+def database_menu(api: tradeapi.REST):
+    """Menu principal da base de dados SQLite."""
+    db = get_db()
+
+    while True:
+        console.print(Rule("[bold cyan]🗄️  Base de Dados Local[/bold cyan]"))
+        console.print(
+            f"  [dim]Ficheiro: {DB_PATH}[/dim]\n"
+        )
+        console.print(
+            "  [bold cyan]1[/bold cyan] Ver trades guardados\n"
+            "  [bold cyan]2[/bold cyan] Estatísticas pessoais\n"
+            "  [bold cyan]3[/bold cyan] Evolução de equity (30 dias)\n"
+            "  [bold cyan]4[/bold cyan] Notas por ticker\n"
+            "  [bold cyan]5[/bold cyan] Sincronizar histórico Alpaca\n"
+            "  [bold cyan]6[/bold cyan] Guardar snapshot de hoje\n"
+            "  [bold cyan]7[/bold cyan] Exportar tabela para CSV\n"
+            "  [bold cyan]8[/bold cyan] Ver backtests guardados\n"
+            "  [bold cyan]0[/bold cyan] Voltar\n"
+        )
+        op = Prompt.ask("  Opção", default="0").strip()
+
+        if op == "0":
+            break
+
+        elif op == "1":
+            _show_db_trades(db)
+
+        elif op == "2":
+            _show_db_stats(db)
+
+        elif op == "3":
+            _show_db_equity(db)
+
+        elif op == "4":
+            _notes_ui(db)
+            continue
+
+        elif op == "5":
+            limit = int(Prompt.ask("  Nº de ordens a importar", default="200"))
+            with console.status("[cyan]A sincronizar com Alpaca…[/cyan]"):
+                n = db.sync_from_alpaca(api, limit)
+            console.print(f"[green]✅ {n} ordens sincronizadas.[/green]")
+
+        elif op == "6":
+            try:
+                acct = api.get_account()
+                pos  = api.list_positions()
+                snap = json.dumps([{
+                    "symbol": p.symbol,
+                    "qty": p.qty,
+                    "value": float(p.market_value),
+                    "pnl": float(p.unrealized_pl),
+                } for p in pos])
+                db.save_snapshot(
+                    date    = datetime.now().strftime("%Y-%m-%d"),
+                    equity  = float(acct.equity),
+                    cash    = float(acct.cash),
+                    pl_day  = float(getattr(acct, "unrealized_pl", 0)),
+                    n_pos   = len(pos),
+                    snapshot_json = snap,
+                )
+                console.print(
+                    f"[green]✅ Snapshot guardado:[/green]  "
+                    f"Equity ${float(acct.equity):,.2f}  ·  {len(pos)} posições"
+                )
+            except Exception as e:
+                console.print(f"[red]Erro: {e}[/red]")
+
+        elif op == "7":
+            tables = ["trades", "alerts_log", "sltp_log",
+                      "daily_snapshots", "notes", "backtest_runs"]
+            console.print("  Tabelas disponíveis: " +
+                          "  ".join(f"[cyan]{t}[/cyan]" for t in tables))
+            tbl  = Prompt.ask("  Tabela a exportar").strip()
+            path = Prompt.ask("  Caminho do ficheiro CSV",
+                              default=f"{tbl}.csv")
+            try:
+                n = db.export_csv(tbl, path)
+                console.print(f"[green]✅ {n} registos exportados → {path}[/green]")
+            except Exception as e:
+                console.print(f"[red]Erro: {e}[/red]")
+
+        elif op == "8":
+            runs = db.get_backtests()
+            if not runs:
+                console.print("[yellow]Sem backtests guardados.[/yellow]")
+            else:
+                table = Table(box=box.SIMPLE_HEAD, header_style="bold dim")
+                table.add_column("ID",       width=4, justify="right")
+                table.add_column("Estratégia", width=20)
+                table.add_column("Ticker",   width=8)
+                table.add_column("TF",       width=4)
+                table.add_column("Retorno",  width=10, justify="right")
+                table.add_column("B&H",      width=10, justify="right")
+                table.add_column("Sharpe",   width=8,  justify="right")
+                table.add_column("Max DD",   width=10, justify="right")
+                table.add_column("Win %",    width=8,  justify="right")
+                table.add_column("Data",     width=12)
+                for r in runs:
+                    rc = "green" if r["total_ret"] >= 0 else "red"
+                    table.add_row(
+                        str(r["id"]), r["strategy"], r["symbol"], r["timeframe"],
+                        f"[{rc}]{r['total_ret']:+.1f}%[/{rc}]",
+                        f"{r['bh_ret']:+.1f}%",
+                        f"{r['sharpe']:.2f}",
+                        f"{r['max_dd']:.1f}%",
+                        f"{r['win_rate']:.1f}%",
+                        r["created_at"][:10],
+                    )
+                console.print(Panel(table, title="[dim]Backtests Guardados[/dim]", border_style="dim"))
+
+        console.print()
+        input("  ↩  Prima Enter para continuar…")
+
+
+# ══════════════════════════════════════════════════════════════
 #  MENU PRINCIPAL
 # ══════════════════════════════════════════════════════════════
 
@@ -3218,13 +3843,14 @@ MENU_OPTIONS = {
     "5":  ("🧪 Backtesting",                    "backtest"),
     "6":  ("📐 Análise de Risco & Sizing",      "risk"),
     "7":  ("🤖 IA & Automação",                 "ia_auto"),
-    "8":  ("📋 Ordens Pendentes",               "orders"),
-    "9":  ("➕ Nova Ordem",                     "place"),
-    "10": ("❌ Cancelar Ordem",                 "cancel"),
-    "11": ("📉 Cotação Rápida",                 "quote"),
-    "12": ("📜 Histórico de Trades",            "history"),
-    "13": ("🔔 Alertas de Preço",               "alerts"),
-    "14": ("🛡️  Stop-Loss / Take-Profit",       "sltp"),
+    "8":  ("🗄️  Base de Dados Local",           "database"),
+    "9":  ("📋 Ordens Pendentes",               "orders"),
+    "10": ("➕ Nova Ordem",                     "place"),
+    "11": ("❌ Cancelar Ordem",                 "cancel"),
+    "12": ("📉 Cotação Rápida",                 "quote"),
+    "13": ("📜 Histórico de Trades",            "history"),
+    "14": ("🔔 Alertas de Preço",               "alerts"),
+    "15": ("🛡️  Stop-Loss / Take-Profit",       "sltp"),
     "0":  ("🚪 Sair",                           "exit"),
 }
 
@@ -3272,6 +3898,10 @@ def main():
     auto_trader = AutoTrader(api, interval=60)
     auto_trader.start()
     console.print("[green]✅ AutoTrader activo[/green]  [dim](intervalo: 60s)[/dim]")
+
+    # Inicializar base de dados local
+    db = get_db()
+    console.print(f"[green]✅ Base de dados SQLite iniciada[/green]  [dim]({DB_PATH})[/dim]")
     console.print()
 
     while True:
@@ -3306,6 +3936,8 @@ def main():
             risk_menu(api)
         elif action == "ia_auto":
             ia_automation_menu(ai_client, api, auto_trader)
+        elif action == "database":
+            database_menu(api)
         elif action == "orders":
             show_open_orders(api)
         elif action == "place":
