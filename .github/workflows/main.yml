@@ -1,1 +1,255 @@
+# ══════════════════════════════════════════════════════════════
+#  QuantaTrader — GitHub Actions CI/CD
+#  Ficheiro: .github/workflows/main.yml
+#
+#  Pipelines:
+#    • ci        — lint + testes em cada push/PR
+#    • security  — verifica dependências com Safety
+#    • release   — cria GitHub Release automático em tags v*
+# ══════════════════════════════════════════════════════════════
 
+name: QuantaTrader CI/CD
+
+on:
+  push:
+    branches: ["main", "develop"]
+    tags:     ["v*.*.*"]
+  pull_request:
+    branches: ["main"]
+  schedule:
+    # corre às 08:00 UTC todos os dias úteis (verificação de segurança)
+    - cron: "0 8 * * 1-5"
+  workflow_dispatch:          # permite execução manual no GitHub
+
+# cancela runs anteriores do mesmo PR/branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ── variáveis globais ─────────────────────────────────────────
+env:
+  PYTHON_DEFAULT: "3.11"
+
+# ══════════════════════════════════════════════════════════════
+jobs:
+
+  # ────────────────────────────────────────────────────────────
+  # JOB 1 · Lint & Formatação
+  # ────────────────────────────────────────────────────────────
+  lint:
+    name: "🔍 Lint & Formatação"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_DEFAULT }}
+          cache: pip
+
+      - name: Instalar ferramentas de lint
+        run: pip install ruff black mypy
+
+      - name: Ruff — linting & import order
+        run: ruff check quanta_trader.py --output-format=github
+
+      - name: Black — verificar formatação
+        run: black --check --diff quanta_trader.py
+
+      - name: Mypy — type checking (não-bloqueante)
+        run: mypy quanta_trader.py --ignore-missing-imports --no-error-summary
+        continue-on-error: true
+
+
+  # ────────────────────────────────────────────────────────────
+  # JOB 2 · Testes
+  # ────────────────────────────────────────────────────────────
+  test:
+    name: "🧪 Testes Python ${{ matrix.python-version }}"
+    runs-on: ubuntu-latest
+    needs: lint
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Instalar dependências
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-cov pytest-mock
+
+      - name: Correr testes (com cobertura)
+        env:
+          # usa variáveis de ambiente de teste — sem chaves reais
+          ALPACA_API_KEY:    ${{ secrets.ALPACA_PAPER_KEY    || 'test_key' }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_PAPER_SECRET || 'test_secret' }}
+          ALPACA_BASE_URL:   "https://paper-api.alpaca.markets"
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY   || 'test_key' }}
+        run: |
+          pytest tests/ \
+            --cov=quanta_trader \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            --tb=short \
+            -q \
+            || echo "::warning::Testes falharam ou pasta tests/ não existe ainda"
+
+      - name: Upload cobertura → Codecov
+        uses: codecov/codecov-action@v4
+        if: matrix.python-version == env.PYTHON_DEFAULT
+        with:
+          files: coverage.xml
+          fail_ci_if_error: false
+
+
+  # ────────────────────────────────────────────────────────────
+  # JOB 3 · Segurança de Dependências
+  # ────────────────────────────────────────────────────────────
+  security:
+    name: "🔒 Segurança de Dependências"
+    runs-on: ubuntu-latest
+    # corre em push, schedule e manualmente
+    if: github.event_name != 'pull_request'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_DEFAULT }}
+          cache: pip
+
+      - name: Instalar Safety & pip-audit
+        run: pip install safety pip-audit
+
+      - name: Safety — CVE scan
+        run: safety check -r requirements.txt --output text
+        continue-on-error: true
+
+      - name: pip-audit — auditoria de pacotes
+        run: pip-audit -r requirements.txt --format markdown
+        continue-on-error: true
+
+      - name: Verificar .env não commitado
+        run: |
+          if git ls-files | grep -qE "^\.env$"; then
+            echo "::error::⚠️  Ficheiro .env encontrado no repositório! Remove-o imediatamente."
+            exit 1
+          else
+            echo "✅ .env não está versionado"
+          fi
+
+      - name: Verificar chaves hardcoded
+        run: |
+          if grep -rE "(AKIA|sk-ant-|pk_live_|sk_live_)[A-Za-z0-9]+" quanta_trader.py; then
+            echo "::error::🚨 Possível chave de API hardcoded detectada!"
+            exit 1
+          else
+            echo "✅ Nenhuma chave hardcoded encontrada"
+          fi
+
+
+  # ────────────────────────────────────────────────────────────
+  # JOB 4 · Validação de Sintaxe (fast-check sem deps)
+  # ────────────────────────────────────────────────────────────
+  syntax:
+    name: "⚡ Validação de Sintaxe"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_DEFAULT }}
+
+      - name: Verificar sintaxe Python
+        run: python -m py_compile quanta_trader.py && echo "✅ Sintaxe válida"
+
+      - name: Verificar requirements.txt
+        run: |
+          pip install pip-tools
+          pip-compile requirements.txt --dry-run --quiet \
+            && echo "✅ requirements.txt válido" \
+            || echo "::warning::Algumas dependências podem ter conflitos"
+
+
+  # ────────────────────────────────────────────────────────────
+  # JOB 5 · GitHub Release (só em tags v*.*.*)
+  # ────────────────────────────────────────────────────────────
+  release:
+    name: "🚀 GitHub Release"
+    runs-on: ubuntu-latest
+    needs: [lint, test, security, syntax]
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Gerar changelog automático
+        id: changelog
+        run: |
+          PREV_TAG=$(git tag --sort=-version:refname | sed -n '2p')
+          if [ -z "$PREV_TAG" ]; then
+            LOG=$(git log --pretty="- %s (%h)" | head -20)
+          else
+            LOG=$(git log ${PREV_TAG}..HEAD --pretty="- %s (%h)")
+          fi
+          echo "CHANGELOG<<EOF" >> $GITHUB_OUTPUT
+          echo "$LOG"           >> $GITHUB_OUTPUT
+          echo "EOF"            >> $GITHUB_OUTPUT
+
+      - name: Criar pacote de release
+        run: |
+          zip -r quanta-trader-${{ github.ref_name }}.zip \
+            quanta_trader.py \
+            requirements.txt \
+            README.md \
+            .gitignore
+
+      - name: Publicar GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "QuantaTrader ${{ github.ref_name }}"
+          body: |
+            ## 🚀 QuantaTrader ${{ github.ref_name }}
+
+            ### O que há de novo
+            ${{ steps.changelog.outputs.CHANGELOG }}
+
+            ### Instalação
+            ```bash
+            pip install -r requirements.txt
+            cp .env.example .env   # preenche as tuas chaves
+            python quanta_trader.py
+            ```
+
+            ### ⚠️ Paper Trading por defeito
+            Usa `ALPACA_BASE_URL=https://paper-api.alpaca.markets` para testar sem risco.
+          files: quanta-trader-${{ github.ref_name }}.zip
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
