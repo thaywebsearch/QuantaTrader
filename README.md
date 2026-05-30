@@ -1,5 +1,7 @@
 # ⚡ QuantaTrader — AI-Powered Trading Assistant
 
+[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://quantatrader-demo.streamlit.app)
+
 > Assistente de trading em Python inspirado no Alpaca, com integração de IA (Claude) para análise de mercado.
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python)
